@@ -28,6 +28,7 @@ class WhiteNoise(StaticModel):
         x_t given x_{1:t-1} and model parameters θ^(i)
         '''
         sigma = theta['sigma']
+        print("Sigma particles:", np.round(sigma, 2))
         assert not np.isnan(sigma).any(), "NaNs in volatilities"
         assert all(sigma >= 0), "Volatility is negative for some particles"
 
@@ -43,8 +44,8 @@ T = 100
 X = np.random.normal(loc=0, scale=1, size=T)
 
 # run IBIS
-prior = dists.StructDist({'sigma': dists.Normal()})
+prior = dists.StructDist({'sigma': dists.LogNormal()})  # support on R_+
 white = WhiteNoise(innov='norm', prior=prior, data=X)
 ibis = IBIS(model=white, len_chain=10, wastefree=False)
-algo_white = SMC(fk=ibis, N=50, resampling='systematic', ESSrmin=0.5, verbose=True)
+algo_white = SMC(fk=ibis, N=10, resampling='systematic', ESSrmin=0.5, verbose=True)
 algo_white.run()
