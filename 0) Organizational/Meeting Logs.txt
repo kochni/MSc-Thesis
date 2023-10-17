@@ -8,11 +8,16 @@ UPDATE:
 (3) reading about RC (how to implement neural models), Bayesian model assessment
 
 QUESTIONS:
-(1) IBIS samples parameters outside prior domain / constraints --> in move/MCMC step, how possible that particles with 0 prior prob accepted?
-
+(1) IBIS samples parameters outside prior support, i.e. constraints --> in move/MCMC step, how possible that particles with 0 prior prob accepted?
+--> should indeed not happen; fix: enforce non-negativity by exponentiating; transforming parameter space can generally improve efficiency
 (2) Bootstrap vs Guided vs Auxiliary PF for StochVol? 'waste-free'?
+--> in StochVol models, observation not very informative about volatility, hence bootstrap should work OK; guided may well improve it, worth looking into; auxiliary most likely not worth it; wastefree might improve slightly, worth looking into whether there are cons/risks with it (like with auxiliary filter)
 
-(3) Models to include & relevance of prior: concept of "evidence"/"marg. lik." not limited to Bayesian models, e.g. HMMs; could compare MLE StochVol vs. Bayesian StochVol?
+NEXT STEPS:
+(1) create github repo
+(2) check issue in MH move step
+(3) get dynamic models running
+(4) ask Bühlmann re Cluster share
 
 
 ================
