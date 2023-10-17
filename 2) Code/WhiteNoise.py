@@ -4,8 +4,11 @@
 import numpy as np
 import scipy
 
-from particles.smc_samplers import StaticModel
+# SMC packages
+import particles
 from particles import distributions as dists
+from particles import SMC
+from particles.smc_samplers import StaticModel, IBIS, SMC2
 
 
 class WhiteNoise(StaticModel):
@@ -34,3 +37,14 @@ class WhiteNoise(StaticModel):
         else:
             return scipy.stats.t.logpdf(self.data[t], loc=0, scale=sigma)
 
+
+# generate some data
+T = 100
+X = np.random.normal(loc=0, scale=1, size=T)
+
+# run IBIS
+prior = dists.StructDist({'sigma': dists.Normal()})
+white = WhiteNoise(innov='norm', prior=prior, data=X)
+ibis = IBIS(model=white, len_chain=10, wastefree=False)
+algo_white = SMC(fk=ibis, N=50, resampling='systematic', ESSrmin=0.5, verbose=True)
+algo_white.run()
