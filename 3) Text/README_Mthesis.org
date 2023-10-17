@@ -1,0 +1,28 @@
+		{Emacs Org mode: use  Emacs [Org] menu,
+		or directly [Tab] on the colored lines below:}
+* A few comments about the template for the Master Thesis
+  - Author: Sarah Gerster
+  - Date: 11 Jun 2009 // updated Sep.2010, Martin Mächler
+
+This Directory should contain all files needed to compile your
+work at home. However, you will not get the newest versions of
+the definitions (files.sty). So if something works at ETH, but
+not at home, you probably have to get the latest .sty.
+
+** Generate files of different format:
+ - .pdf: press Ctrl+c Ctrl+c then type latex PDF in emacs (minibuffer)
+
+*** not really recommended anymore:
+  - .dvi: press Ctrl+c Ctrl+c then type latex in emacs (minibuffer)
+  - .ps: press Ctrl+c Ctrl+c then type print in emacs (minibuffer).
+          choose ps as printer
+
+** Don't forget to spell-check your text 
+   (for example in emacs: Tools -> Spell Checking)
+
+** Do generate *.pdf graphics files in R --> see ./Pictures/picture.R
+** Otherwise: (This is only needed if you got .eps from somewhere!)
+   Convert your .eps graphs in .pdf: in the terminal, type 
+   eps2pdf *.eps
+
+

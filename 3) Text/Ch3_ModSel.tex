@@ -1,0 +1,54 @@
+\chapter{Bayesian Model Assessment, Selection, \& Comparison}
+
+\section{Basics of Bayesian Statistics}
+
+\begin{equation*}
+\pi(\theta \mid x) ~ = ~ \frac{ \pi(\theta) \, p(x \mid \theta) }{ p(x) }
+\end{equation*}
+
+Bernstein-von Mises theorem
+
+
+\section{Model Assessment}
+
+Goals: (i) identify "correct" model, (ii) identify model with superior predictive accuracy
+
+in-sample predictive error: downward biased, even for Bayesian models; cross-validation popular in practice, but computationally expensive; information criteria adjust for bias
+
+Bayesian cross-validation: same as standard cross-validation, but assess mean predictive density on test set $p(X_{test}) = \int p(X_{test} \mid \theta) \d \pi(\theta \mid X_{train})$
+
+asymptotically (for $N \to \infty$) xyIC equivalent to cross-validation (also for time series??)
+
+\begin{definition}[Evidence]
+Consider a probabilistic, parametric model for the data-generating process of a dataset $X_{1:t}$ parametrized by $\theta \in \Theta$ with prior law $\pi_0(\theta)$. The evidence $Z_t$ of the model given data $X_{1:t}$ is
+\begin{equation*}
+Z_t ~ := ~ \int_\Theta p(X_{1:t} \mid \theta) \d \pi_0(\theta)
+\end{equation*}
+\end{definition}
+Equivalently, the evidence of a model can also be seen as the marginal likelihood $p(X_{1:t})$ of the data or as the expected likelihood of the dataset, $\E_{\pi_0} \Big[ p(X_{1:t} \mid \theta) \Big]$.
+
+\subsection{Information Criteria}
+
+\begin{definition}[Bayesian Information Criterion]
+\end{definition}
+
+
+
+\begin{definition}[Deviance Information Criterion]
+\begin{align*}
+\textrm{DIC} ~ :=& ~ -2 \log p(X \mid \hat{\theta}) + 2 k_{\textrm{eff}} \\
+k_{\textrm{eff}} ~ =& ~ 2 \left( \log p(X \mid \hat{\theta}) - \E_{\pi_t} \left[ \log p(X \mid \theta) \right] \right)
+\end{align*}
+\end{definition}
+
+\begin{definition}[Watanabe--Akaike Information Criterion]
+\end{definition}
+
+plug-in predictive distribution
+\begin{equation*}
+p(X_{t+1} \mid X_{1:t}) ~ = ~ \int_\Theta p(X_{t+1} \mid X_{1:t}, \theta) \d \pi_t(\theta \mid X_{1:t})
+\end{equation*}
+
+\section{Model Comparison}
+
+\subsection{Bayes Factors}
