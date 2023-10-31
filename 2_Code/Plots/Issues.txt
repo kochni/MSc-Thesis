@@ -1,0 +1,4 @@
+
+Open:
+ - all: 'overflow' & 'divide by zero' error when using flat prior
+ - StochVol: when __init__ used, 'not callable'
