@@ -6,273 +6,483 @@ from scipy import stats
 
 # SMC packages
 from particles.smc_samplers import StaticModel
+from particles.distributions import Mixture, Normal, Student
+from particles.hmm import HMM, BaumWelch
+
+# signatures
+from esig import stream2sig, stream2logsig
 
 # other utilts
 from numpy.lib.recfunctions import structured_to_unstructured
-from helpers import *
-
-# documentation:
-# https://particles-sequential-monte-carlo-in-python.readthedocs.io/en/latest/_autosummary/particles.smc_samplers.html#module-particles.smc_samplers
-
-# source code:
-# https://github.com/nchopin/particles/blob/master/particles/smc_samplers.py
+from operator import itemgetter
+# from helpers import *
 
 
-class WhiteNoise(StaticModel):
+class DetVol(StaticModel):
     '''
-    White noise process, i.e. process of the form
-        X_t = σ·Z_t
+    Any model for which either
+        - the conditional volatility (and hence likelihood) is known given the
+          past observations and the model parameters (e.g. GARCH, ELM)
+        - the expected likelihood (over any latent variables) can be computed
+          analytically (e.g., models w regime switching or jumps in returns)
+
+    This allows for using the IBIS algorithm.
+
     '''
 
-    def __init__(self, innov, prior, data):
+    def __init__(self, spec, prior, data):
         super().__init__(data, prior)
 
-        assert innov in ['N', 't'], "Innovation distribution not implemented"
-        self.innov = innov
+        # define model
+        dynamics = spec['dynamics']
+        variant = spec.get('variant')
+        hyper = spec.get('hyper')
+        self.switching = spec.get('switching')
+        self.K = K = spec.get('regimes') if self.switching is not None else 1
 
-        self.s2_0 = np.var(data)  # initial volatility
+        if dynamics == 'constant':
+            self.model = WhiteNoise(K)
+
+        elif dynamics == 'garch':
+            if variant == 'elm':
+                self.model = ResComp('elm', hyper, K)
+            else:
+                self.model = GARCH(variant, K)
+
+        elif dynamics == 'sig':
+            self.model = ResComp(variant, hyper, K)
+
+        elif dynamics == 'guyon':
+            self.model = Guyon(K)
+
+        self.jumping = spec.get('jumps')
+        self.innov_X = spec.get('innov_X')
+
+        err_msg = "Specified multi-regime model but not switching type"
+        if self.K > 1: assert self.switching is not None, err_msg
+
+    def probs(self, theta, X, t):
+        '''
+        probabilities of volatility regimes
+
+        Output: p_t, (N, K) array
+            where p_t[i, j] probability of j-th regime at time t given
+            parameters from i-th particle
+
+        '''
+
+        shape = [len(theta), self.K]
+        p_t = np.full(shape, np.nan)
+
+        # Single-Regime Models:
+        if self.K == 1:
+            p_t = np.full(shape, 1.)
+
+        # Mixture Models:
+        elif self.switching in ['mix', 'mixing', 'mixture']:
+            ps = theta['p_0'] if self.K == 2 else theta['p']
+            ps = ps.reshape(-1, self.K-1)
+            p_t[:, 0:-1] = ps
+            p_t[:, -1] = 1 - np.sum(ps, axis=1)
+
+        # Markov-Switching Models:
+        else:
+            for i in range(len(theta)):  # (!) vectorize ??
+                df = theta['df'][i] if 'df' in theta.dtype.names else None
+                P = np.full([self.K, self.K], 0.)  # transition matrix
+                for k in range(self.K):
+                    P[k, 0:-1] = theta['P_' + str(k)][i]
+                P[:, -1] = 1 - np.sum(P, axis=1)
+
+                # HMM with given parameters
+                hmm = HybridHMM(model=self.model, theta=theta[[i]],
+                                X=self.data, t=t, trans_mat=P, df=df)
+                # compute probabilities of regimes given past data
+                if t > 0:
+                    bw = BaumWelch(hmm=hmm, data=self.data[0:t])
+                    bw.forward()
+                    bw.backward()
+                    # print("p_", t, "(i=", i, "):", bw.pred[-1])
+                    p_t[i, :] = bw.pred[-1]
+                else:
+                    p_t[i, :] = 1. / self.K
+
+        return p_t
 
     def logpyt(self, theta, t):
         '''
-        for each θ-particle θ^(i), compute log-likelihood of current
-        observation x_t given x_{1:t-1} and model parameters θ^(i)
+        (expected) likelihood of parameters
+
         '''
-        sigma = theta['sigma']
-        s2_t = np.maximum(1e-10, sigma**2)
+        # volatilities:
+        s_t = self.model.vol(theta=theta, X=self.data, t=t)  # (N,K) array
+        s_t = cap(s_t, floor=1e-100, ceil=1e100)
+        assert not np.isnan(s_t).any(), "NaNs in volatilities"
 
-        assert not np.isnan(s2_t).any(), "NaNs in volatilities"
+        # regime probabilities:
+        p_t = self.probs(theta, self.data, t)  # (N,K) array
+        p_t = cap(p_t, floor=1e-50, ceil=1.)
+        assert not np.isnan(p_t).any(), "NaNs in regime probabilities"
 
-        # compute log-likelihood given σ_t and distribution
-        if self.innov == 'N':
-            return (-0.5*np.log(s2_t) - 1/2*np.log(2*np.pi) -
-                    1/2*self.data[t]**2/s2_t)
+        # get parameters & cap/transform:
+        if 'df_X' in theta.dtype.names:
+            df_X = theta['df_X'].reshape(-1, 1)
+            df_X = cap(df_X, floor=2.+1e-10)
         else:
-            df = theta['df']
-            return stats.t.logpdf(self.data[t], loc=0, scale=np.sqrt(s2_t),
-                                  df=df)
+            df_X = None
+
+        # expected likelihood over regimes:
+        liks = F_innov(sd=s_t, df=df_X).pdf(self.data[t])
+        E_lik = np.einsum('NK,NK->N', p_t, liks)  # Hadamard & row-sum
+        E_lik = E_lik.flatten()
+
+        # expected likelihoods conditional on occurrence of jump:
+        if 'lambda_X' in theta.dtype.names:
+            lambd_X = cap(theta['lambda_X'], floor=0., ceil=1.)
+            phi_X = cap(theta['phi_X'], floor=0.)
+            phi_X = np.tile(phi_X.reshape(-1, 1), [1, self.K])
+
+            sd_jump = np.sqrt(s_t**2 + phi_X**2)
+            liks_jump = F_innov(sd=sd_jump, df=df_X).pdf(self.data[t])
+            E_lik_jump = np.einsum('NK,NK->N', p_t, liks_jump)  # Hadamard & row-sum
+            E_lik_jump = E_lik_jump.flatten()
+
+            # overall expected likelihood
+            E_lik = (1.-lambd_X)*E_lik + lambd_X*E_lik_jump
+
+        E_lik = cap(E_lik, floor=1e-100)  # avoids error when taking log
+        log_E_lik = np.log(E_lik)
+        assert not np.isnan(log_E_lik).any(), "NaNs in log-likelihoods"
+
+        return log_E_lik
+
+    def predict(self, theta, W, t=None, s=1, M=1):
+        '''
+        simulate future evolutions of an estimated process
+
+        Parameters:
+        -----------
+        s: int
+            no. of days ahead to simulate
+        M: int
+            no. of simulated future return paths per θ-particle
+
+        '''
+        # for 1-day ahead, simulation of future returns and hence cloning of
+        # particles not needed
+        M = 1 if s == 1 else M
+        N = len(theta)
+        t = len(self.data) if t is None else t
+        theta = np.repeat(theta, M, 0)  # creates M copies of each θ-particle
+        W = np.repeat(W, M, 0) / M
+        X = self.data[0:t]
+
+        # regime probabilities: fixed if K=1 or mixture; for Markov depend
+        # on time
+        if self.K == 1:
+            p_t = np.full([M*N, self.K], 1.)
+        elif self.switching in ['mix', 'mixing', 'mixture']:
+            p_t = np.full([M*N, self.K], np.nan)
+            ps = theta['p_0'] if self.K == 2 else theta['p']
+            ps = ps.reshape(-1, self.K-1)
+            p_t[:, 0:-1] = ps
+            p_t[:, -1] = 1 - np.sum(ps, axis=1)
+
+        # (1) in-sample volatility estimates + 1-day ahead prediction
+        # (given data until time t)
+        reg_vols = np.full([self.K, t+s], np.nan)  # pred's of each regime
+        vol_pred = np.full(t+s, np.nan)  # reg_vols avg'd over regime prob's
+        for j in range(t+1):
+             vols = self.model.vol(theta, X[0:j], j)  # (M*N,K)
+             reg_vols[:, j] = np.sum(vols * W.reshape(-1,1), axis=0)
+             preds = np.sum(vols * p_t, axis=1)  # (M*N,), pred of particles
+             vol_pred[j] = np.sum(preds * W)  # weigh predictions by W_t
+
+        # (2) out-sample volatility predictions:
+        # for s>1, need to simulate future return paths of length s-1:
+        if s > 1:
+            # get parameters & cap/transform
+            if 'df_X' in theta.dtype.names:
+                df_X = theta['df_X']  # (M*N,)
+                df_X = cap(df_X, floor=2.+1e-10)
+                df_X = np.tile(df_X.reshape(-1, 1, 1), [1, self.K])  # (M*N, 1, K)
+            else:
+                df_X = None
+
+            # N*M*K different future evolutions --> reshape X to (M*N, t+s, K)
+            shape = [M*N, 1, self.K]
+            X = np.tile(self.data[np.newaxis, :, np.newaxis], shape)
+
+            # simulate evolutions & compute vol's:
+            for j in range(1, s):
+                Z_next = F_innov(df=df_X).rvs(size=shape)
+                X_next = vols * Z_next
+                X = np.concatenate([X, X_next], axis=1)
+                vols = self.model.vol(theta, X, t+j)  # (M*N,K); next vol's
+
+                if self.switching == 'markov':
+                    pass
+
+                reg_vols[:, t+j] = np.sum(vols * W.reshape(-1,1), axis=0)
+                preds = np.sum(vols * p_t, axis=1)  # (M*N,)
+                vol_pred[t+j] = np.sum(preds * W)
+
+        return vol_pred, reg_vols
 
 
-class GARCH(StaticModel):
+class WhiteNoise:
     '''
-    GARCH(1,1) model, i.e. process of the form
-        X_t = σ_t·Z_t,
-        σ_t = f(X_{t-1}, σ_{t-1}^2)
-    where f(.) depends on the GARCH variant
+    White noise volatility model:
 
-    Parameters:
-    -----------
-    variant: string
-        GARCH variant; one of 'basic', 'gjr' (for GJR-GARCH), 'thr' (for
-        T-GARCH), 'exp' (for E-GARCH).
+        X_t = σ·Z_t
 
-    innov: string
-        Innovation distribution; must be one of 'N' (for Gaussian) and 't'
-        (for Student t).
-
-    prior: StructDist (from particles.distributions)
-        Prior distributions on the model parameters.
-
-    data: (T,)-array
-        Observations of raw price process.
     '''
 
-    def __init__(self, variant, innov, prior, data, hyper=None):
-        super().__init__(data, prior)
+    def __init__(self, K):
+        self.K = K
 
-        assert variant in ['basic', 'gjr', 'thr', 'exp', 'mix', 'guyon'], (
-            "GARCH variant not implemented")
+    def vol(self, theta, X=None, t=None):
+        if self.K == 1:
+            s_t = theta['sigma'].reshape(-1, 1)
+        else:
+            shape = [len(theta), self.K]
+            s_t = np.full(shape, np.nan)
+            for k in range(self.K):
+                s_t[:, k] = theta['sigma_' + str(k)]
+
+        # transform parameters
+        s_t = np.exp(s_t)
+
+        return s_t
+
+
+class GARCH:
+    '''
+    GARCH volatility models:
+
+        X_t = σ_t·Z_t
+        σ_t^2 = f(X_{t-1}^2, σ_{t-1}^2)
+
+        where f(·,·) depends on the variant.
+
+    '''
+
+    def __init__(self, variant, K, hyper=None):
+
+        msg = "Specified GARCH-variant not implemented"
+        assert variant in ['basic', 'gjr', 'thr', 'exp', 'elm'], msg
         self.variant = variant
-
-        assert innov in ['N', 't'], ("Specified innovation distribution not "
-                                     "implemented")
-        self.innov = innov
         self.hyper = hyper
+        self.K = K
+        self.s2_0 = 1  # initial volatility
 
-    def vol_std(self, theta, t):
+    def vol_std(self, theta, X, t=None):
         '''
-        Standard GARCH volatility
-            σ^2_t = ω + α·X_{t-1}^2 + β·σ_{t-1}^2
-                  = ω·Σ_j(β^{j-1}) + α·Σ_j(β^{j-1}·X_{t-j}^2) + β^{t-1}·σ_1^2
+        compute the standard GARCH volatility for 1 or more regimes at time t
+        given the parameters
         '''
-        omega = theta['omega']
-        alpha = theta['alpha']
-        beta = theta['beta']
+        # by default compute volatility for first period outside dataset
+        t = len(X) if t is None else t
+        N = len(theta)
+        shape = [N, self.K]
 
-        t_grid = np.arange(0, t, 1).reshape(-1, 1)
-        X = self.data.reshape(-1, 1)
-        s2_t = (omega * np.sum(beta**t_grid, axis=0) +
-                alpha*np.sum(beta**t_grid * X[0:t][::-1]**2, axis=0) +
-                beta**t * self.s2_0)
-        s2_t = np.maximum(s2_t, 1e-10)
+        if self.K == 1:
+            omegas = theta['omega'].reshape(shape)
+            alphas = theta['alpha'].reshape(shape)
+            betas = theta['beta'].reshape(shape)
+        else:
+            omegas = np.full(shape, np.nan)
+            alphas = np.full(shape, np.nan)
+            betas = np.full(shape, np.nan)
+            for k in range(self.K):
+                omegas[:, k] = theta['omega_' + str(k)]
+                alphas[:, k] = theta['alpha_' + str(k)]
+                betas[:, k] = theta['beta_' + str(k)]
 
-        return s2_t
+        # transform & cap parameters:
+        omegas = cap(omegas, floor=1e-20)
+        alphas = cap(alphas, floor=1e-20)
+        betas = cap(betas, floor=1e-20, ceil=1.)
 
-    def vol_gjr(self, theta, t):
+        # previous returns in reverse order (first entry = previous return)
+        if X.ndim == 1:
+            X_rev = X[0:t][::-1]  # (t,)
+            X_rev = X_rev.reshape(1, -1, 1)
+        else:
+            X_rev = X[:, 0:t, :][:, ::-1, :]  # (N,t,K)
+
+        t_grid = np.arange(0, t, 1)  # all time lags
+
+        # compute GARCH volatilities:
+        # s2_t = ω·Σ_{j=1}^t β^j + α·Σ_{j=1}^t β^j X_{t-j}^2 + β^t·σ_0^2
+        beta_pow = betas[:, :, np.newaxis] ** t_grid  # (t,N,K)
+        beta_pow = np.swapaxes(beta_pow, 1, 2)  # (N,t,K)
+        a = np.einsum('NtK->NK', beta_pow)  # sum over axis 1
+        a = np.einsum('NK,NK->NK', omegas, a)  # Hadamard product
+        b = np.einsum('NtK,NtK->NtK', beta_pow, X_rev**2)
+        b = np.einsum('NtK->NK', b)
+        b = np.einsum('NK,NK->NK', alphas, b)
+        c = betas**t * self.s2_0
+        s2_t = a + b + c
+        # --> s2_t[i, j] is squared volatility of i-th particle in j-th regime
+
+        s2_t = cap(s2_t, floor=1e-100)  # avoids error from sqrt
+        s_t = np.sqrt(s2_t)
+
+        return s_t
+
+    def vol_gjr(self, theta, X, t):
         '''
-        GJR-GARCH volatility
-            σ^2_t = ω + (α + γ·1(X_{t-1}>0))·X_{t-1}^2 + β·σ_{t-1}^2
-        '''
-        omega = theta['omega']
-        alpha = theta['alpha']
-        beta = theta['beta']
-        gamma = theta['gamma']
+        compute the GJR-GARCH volatility for K regimes at time t:
 
-        s2_j = np.tile(self.s2_0, len(theta))
+            σ_t^2 = ω + (α + γ·1(X_{t-1}>0))·X_{t-1}^2 + β·σ_{t-1}^2
+
+        '''
+        N = len(theta)
+        shape = [N, self.K]
+
+        if self.K == 1:
+            omegas = theta['omega'].reshape(shape)
+            alphas = theta['alpha'].reshape(shape)
+            betas = theta['beta'].reshape(shape)
+            gammas = theta['gamma'].reshape(shape)
+        else:
+            omegas = np.full(shape, np.nan)
+            alphas = np.full(shape, np.nan)
+            betas = np.full(shape, np.nan)
+            gammas = np.full(shape, np.nan)
+            for k in range(self.K):
+                omegas[:, k] = theta['omega_' + str(k)]
+                alphas[:, k] = theta['alpha_' + str(k)]
+                betas[:, k] = theta['beta_' + str(k)]
+                gammas[:, k] = theta['gamma_' + str(k)]
+
+        # transform & cap parameters:
+        omegas = cap(omegas, floor=1e-20)
+        alphas = cap(alphas, floor=1e-20)
+        betas = cap(betas, floor=1e-20, ceil=1.)
+
+        if X.ndim == 1:
+            X = X.reshape(1, -1, 1)  # (1,t,1)
+        # else X has shape (N,t,K)
+
+        s2_j = np.tile(self.s2_0, shape)
         for j in range(1, t+1):
             s2_prev = s2_j
-            s2_j = (omega + (alpha + gamma*(self.data[j-1]>0))*self.data[j-1]**2
-                    + beta*s2_prev)
+            s2_j = (omegas + (alphas + gammas*(X[:, j-1, :]<0))*X[:, j-1, :]**2
+                    + betas*s2_prev)
 
-        s2_j = np.maximum(s2_j, 1e-10)
+        s2_j = cap(s2_j, floor=1e-100)  # avoids error from sqrt
+        s_t = np.sqrt(s2_j)
 
-        return s2_j
+        return s_t
 
-    def vol_thr(self, theta, t):
+    def vol_thr(self, theta, X, t):
+        '''
+        compute the Threshold-GARCH volatility for K regimes at time t:
 
-        omega = theta['omega']
-        alpha = theta['alpha']
-        beta = theta['beta']
-        gamma = theta['gamma']
+            σ^2_t = ω + (α + γ·1(X_{t-1}>0))·X_{t-1}^2 + β·σ_{t-1}^2
 
-        s_j = np.tile(np.sqrt(self.s2_0), len(theta))  # initial volatility
+        '''
+        shape = [len(theta), self.K]
+
+        if self.K == 1:
+            omegas = theta['omega'].reshape(shape)
+            alphas = theta['alpha'].reshape(shape)
+            betas = theta['beta'].reshape(shape)
+            gammas = theta['gamma'].reshape(shape)
+        else:
+            omegas = np.full(shape, np.nan)
+            alphas = np.full(shape, np.nan)
+            betas = np.full(shape, np.nan)
+            gammas = np.full(shape, np.nan)
+            for k in range(self.K):
+                omegas[:, k] = theta['omega_' + str(k)]
+                alphas[:, k] = theta['alpha_' + str(k)]
+                betas[:, k] = theta['beta_' + str(k)]
+                gammas[:, k] = theta['gamma_' + str(k)]
+
+        if X.ndim == 1:
+            X = X.reshape(1, -1, 1)  # (1,t,1)
+        # else X has shape (N,t,K)
+
+        s_j = np.tile(np.sqrt(self.s2_0), shape)  # initial volatility
         for j in range(1, t+1):
             s_prev = s_j
-            Z_prev = self.data[j-1] / s_prev
+            s_j = (omegas + alphas*abs(X[:, j-1, :]) + gammas*X[:, j-1, :] +
+                   betas*s_prev)
 
-            s_j = omega + alpha*abs(Z_prev) + gamma*Z_prev + beta*s_prev
+        return s_j
 
-        s2_j = np.maximum(s_j**2, 1e-10)
-
-        return s2_j
-
-    def vol_exp(self, theta, t):
+    def vol_exp(self, theta, X, t):
         '''
-        Exponential GARCH volatility
+        compute the Exponential-GARCH volatility for K regimes at time t:
+
             log(σ^2_t) = ω + α·(|Z_{t-1}| + γ·Z_{t-1}) + β·log(σ^2_{t-1})
-        '''
-        omega = theta['omega']
-        alpha = theta['alpha']
-        beta = theta['beta']
-        gamma = theta['gamma']
 
-        log_s2_j = np.tile(np.log(self.s2_0), len(theta))
+        '''
+        shape = [len(theta), self.K]
+
+        if self.K == 1:
+            omegas = theta['omega'].reshape(shape)
+            alphas = theta['alpha'].reshape(shape)
+            betas = theta['beta'].reshape(shape)
+            gammas = theta['gamma'].reshape(shape)
+        else:
+            omegas = np.full(shape, np.nan)
+            alphas = np.full(shape, np.nan)
+            betas = np.full(shape, np.nan)
+            gammas = np.full(shape, np.nan)
+            for k in range(self.K):
+                omegas[:, k] = theta['omega_' + str(k)]
+                alphas[:, k] = theta['alpha_' + str(k)]
+                betas[:, k] = theta['beta_' + str(k)]
+                gammas[:, k] = theta['gamma_' + str(k)]
+
+        if X.ndim == 1:
+            X = X.reshape(1, -1, 1)  # (1,t,1)
+        # else X has shape (N,t,K)
+
+        log_s2_j = np.tile(np.log(self.s2_0), shape)
         for j in range(1, t+1):
             log_s2_prev = log_s2_j
-            Z_prev = self.data[j-1]/np.exp(log_s2_prev/2)
-            log_s2_j = omega + alpha*(abs(Z_prev) + gamma*Z_prev) + beta*log_s2_prev
-            log_s2_j = np.minimum(100, np.maximum(-100, log_s2_j))
+            log_s2_j = (omegas + alphas*abs(X[:, j-1, :]) + gammas*X[:, j-1, :]
+                        + betas*log_s2_prev)
+            log_s2_j = cap(log_s2_j, floor=-100, ceil=100)
 
-        s2_j = np.exp(log_s2_j)
+        s_t = np.exp(log_s2_j/2)
 
-        return s2_j
+        return s_t
 
-    def vol_mix(self, theta, t):
-        '''
-        Mixture GARCH volatility,
-        '''
-        K = self.hyper['K']
-        P = np.full([len(theta), K], np.nan)
-        for k in range(K-1):
-            globals()['p_' + str(k)] = P[:, k] =  theta['p_' + str(k)]
-        P[:, -1] = 1 - np.sum(P[:, 0:-1], axis=1)
+    def vol(self, theta, X, t):  # wrapper
 
-        omegas = np.full([len(theta), K], np.nan)
-        alphas = np.full([len(theta), K], np.nan)
-        betas = np.full([len(theta), K], np.nan)
-        for k in range(K):
-            globals()['omega_' + str(k)] = omegas[:, k] = theta['omega_' + str(k)]
-            globals()['alpha_' + str(k)] = alphas[:, k] = theta['alpha_' + str(k)]
-            globals()['beta_' + str(k)] = betas[:, k] = theta['beta_' + str(k)]
-
-        E_omega = np.sum(P*omegas, axis=1)
-        E_alpha = np.sum(P*alphas, axis=1)
-        E_beta = np.sum(P*betas, axis=1)
-
-        t_grid = np.arange(0, t, 1).reshape(-1, 1)
-        X = self.data.reshape(-1, 1)
-
-        E_s2_t = (E_omega * np.sum(E_beta**t_grid, axis=0) +
-                  E_alpha*np.sum(E_beta**t_grid * X[0:t][::-1]**2, axis=0) +
-                  E_beta**t)
-        s2_t = np.maximum(E_s2_t, 1e-10)
-
-        return s2_t
-
-    def vol_guyon(self, theta, t):
-        '''
-        Guyon and Lekeufack's (2023) path-dependent volatility model
-        '''
-        beta0 = theta['beta0']    # intercept
-        beta1 = theta['beta1']    # trend coefficient
-        beta2 = theta['beta2']    # volatility coefficient
-        alpha1 = theta['alpha1']  # term in trend kernel
-        alpha2 = theta['alpha2']  #
-        delta1 = theta['delta1']  # term in trend kernel
-        delta2 = theta['delta2']  #
-
-        # if constraints of alpha, delta violated, might cause errors, hence
-        # set to arbitrary value instead (will not be accepted anyways)
-        alpha1 = np.maximum(alpha1, 1 + 1e-10)
-        alpha2 = np.maximum(alpha2, 1 + 1e-10)
-        delta1 = np.maximum(delta1, 1e-10)
-        delta2 = np.maximum(delta2, 1e-10)
-
-        if t == 0:
-            s2_t = np.tile(self.s2_0, len(theta))
-        else:
-            tp_grid = np.arange(0, t, 1)  # grid of all previous time stamps
-            # trend kernel weights:
-            k1 = tspl(t=t, tp=tp_grid, alpha=alpha1, delta=delta1)
-            # volatility kernel weights:
-            k2 = tspl(t=t, tp=tp_grid, alpha=alpha2, delta=delta2)
-            trend = np.sum(k1 * np.transpose(self.data[tp_grid]), axis=1)
-            volat = np.sqrt(np.sum(k2 * np.transpose(self.data[t-tp_grid]**2),
-                                   axis=1))
-
-            s_t = beta0 + beta1*trend + beta2*volat
-            s2_t = np.maximum(s_t**2, 1e-10)
-
-        return s2_t
-
-    def logpyt(self, theta, t):
-        '''
-        for each θ-particle θ^(i), compute log-likelihood of current
-        observation x_t given observations x_{1:t-1} and model parameters θ^(i)
-        '''
-        # get # σ^2_t^(1:N)
         if self.variant == 'basic':
-            s2_t = self.vol_std(theta, t)
+            s_t = self.vol_std(theta, X, t)
+
         elif self.variant == 'gjr':
-            s2_t = self.vol_gjr(theta, t)
+            s_t = self.vol_gjr(theta, X, t)
+
         elif self.variant == 'thr':
-            s2_t = self.vol_thr(theta, t)
+            s_t = self.vol_thr(theta, X, t)
+
         elif self.variant == 'exp':
-            s2_t = self.vol_exp(theta, t)
-        elif self.variant == 'mix':
-            s2_t = self.vol_mix(theta, t)
-        elif self.variant == 'guyon':
-            s2_t = self.vol_guyon(theta, t)
+            s_t = self.vol_exp(theta, X, t)
 
-        assert not np.isnan(s2_t).any(), "NaN volatility for some particles"
+        elif self.variant == 'elm':
+            model = ResComp(variant='elm', hyper=self.hyper, K=self.K)
+            s_t = model.vol(theta, X, t)
 
-        # compute log-likelihood given σ_t and distribution
-        if self.innov == 'N':
-            return (-0.5*np.log(s2_t) - 0.5*np.log(2*np.pi) -
-                    0.5/s2_t*self.data[t]**2)
-        else:
-            df = theta['df']
-            return stats.t.logpdf(self.data[t], loc=0,
-                                  scale=np.sqrt(s2_t), df=df)
+        return s_t
 
 
-class RCStatic(StaticModel):
+class ResComp:
     '''
     Reservoir computers for static volatility models
 
     Parameters:
     -----------
 
-    rc_type: string
+    variant: string
         type of the RC approach use; one of 'elm' (for extreme learning
         machine, ELM), 't_sig' (for truncated signature), and 'r_sig'
         (for randomized signature); ELM is Markovian, while signature-based methods
@@ -300,135 +510,286 @@ class RCStatic(StaticModel):
         data.
     '''
 
-    def __init__(self, rc_type, hyper, innov, prior, data):
-        super().__init__(data, prior)
+    def __init__(self, variant, hyper, K):
 
-        assert innov in ['N', 't'], "Innovation distribution not implemented"
-        self.innov = innov
+        self.variant = variant
+        self.K = K
+        self.q = q = hyper['q']
+        sd = hyper.get('sd')
 
-        self.hyper = hyper
+        # draw random components
+        if variant == 'elm':  # inner parameters of NN
+            H = 20  # hidden layer width
+            self.A1 = np.random.normal(scale=sd, size=[H, 2, K])
+            self.b1 = np.random.normal(scale=sd, size=[H, 1, K])
+            self.A2 = np.random.normal(scale=sd, size=[q, H, K])
+            self.b2 = np.random.normal(scale=sd, size=[q, 1, K])
 
-        assert rc_type in ['elm', 't_sig', 'r_sig'], "RC type not implemented"
-        self.rc_type = rc_type
+        elif variant == 'r_sig':  # random matrices of Controlled ODE
+            self.rsig_0 = np.random.normal(scale=sd, size=[q, 1, K])
+            self.A1 = np.random.normal(scale=sd, size=[q, q, K])
+            self.b1 = np.random.normal(scale=sd, size=[q, 1, K])
+            self.A2 = np.random.normal(scale=sd, size=[q, q, K])
+            self.b2 = np.random.normal(scale=sd, size=[q, 1, K])
 
-        if rc_type == 'elm':  # randomly draw inner parameters of NN
-            self.W1 = np.random.normal(loc=0, scale=hyper['sd'], size=(100, 2))
-            self.W2 = np.random.normal(loc=0, scale=hyper['sd'],
-                                       size=(hyper['q'], 100))
-            self.b1 = np.random.normal(loc=0, scale=hyper['sd'], size=1)
-            self.b2 = np.random.normal(loc=0, scale=hyper['sd'], size=1)
-
-        elif rc_type == 'r_sig':
-            # draw random components of randomized signature
-            self.rsig_0 = np.random.normal(loc=0, scale=hyper['sd'],
-                                           size=hyper['q'])
-            self.A1 = np.random.normal(loc=0, scale=hyper['sd'],
-                                       size=(hyper['q'], hyper['q']))
-            self.b1 = np.random.normal(loc=0, scale=hyper['sd'],
-                                       size=hyper['q'])
-            self.A2 = np.random.normal(loc=0, scale=hyper['sd'],
-                                       size=(hyper['q'], hyper['q']))
-            self.b2 = np.random.normal(loc=0, scale=hyper['sd'],
-                                       size=hyper['q'])
-
-    def elm_vol(self, t, theta):
-        '''
-        compute volatility via a random 2-layer neural network, a.k.a. "extreme
-        learning machine (ELM)"
-        '''
-        theta = structured_to_unstructured(theta)
-        theta = np.minimum(np.exp(50), np.maximum(-np.exp(50), theta))
-
-        if self.innov == 'N':
-            w = theta[:, 1:]  # weights
-            w0 = theta[:, 0]  # bias term
         else:
-            w = theta[:, 1:-1]  # last term is df
-            w0 = theta[:, 0]
+            # compute minimum required truncation level to obtain enough
+            # components as specified in dimensionality (q)
+            self.M = 1
+            while 2*(2**self.M - 1) < self.q: self.M += 1
 
-        s2_0 = np.var(self.data)  # initial volatility
-        log_s2_j = np.tile(s2_0, len(theta))
-        for j in range(1, t+1):
+        # extract repeatedly accessed hyperparameters
+        self.activ = hyper.get('activ')
+        self.s2_0 = 1  # initial volatility
+
+    def elm_vol(self, theta, X, t):
+        '''
+        compute volatility by passing past volatility & returns through a
+        random 2-layer neural network, a.k.a. "extreme learning machine (ELM)"
+
+        '''
+        N = len(theta)
+        shape0 = [N, self.K]  # shape of w0s (bias term)
+        shape = [self.q, N, self.K]  # shape of Ws (linear weights)
+
+        w0s = np.full(shape0, np.nan)
+        Ws = np.full(shape, np.nan)
+
+        if self.K == 1:
+            w0s[:, 0] = theta['w0']
+            for j in range(self.q):
+                Ws[j, :, 0] = theta['w' + str(j)]
+        else:
+            for k in range(self.K):
+                w0s[:, k] = theta['w0_' + str(k)]
+                for j in range(self.q):
+                    Ws[j, :, k] = theta['w' + str(j) + '_' + str(k)]
+
+        w0s = cap(w0s, floor=-1e20, ceil=1e20)
+        Ws = cap(Ws, floor=-1e20, ceil=1e20)
+
+        if X.ndim == 1:
+            X = X.reshape(1, -1, 1)  # (1,t,1)
+            X = np.tile(X, [N, 1, self.K]) # (N,t,K)
+        # else X has shape (N,t,K) already anyway (but w different entries
+        # along axes 0 and 2)
+
+        log_s2_j = np.tile(np.log(self.s2_0), [N, self.K])  # (N,K)
+        for j in range(1, t+1):  # replace with functools.reduce() ?
             log_s2_prev = log_s2_j
 
-            # compute reservoir from previous log-return and volatility
-            M = np.stack((np.array([self.data[t-1]]*len(theta)), log_s2_prev),
-                         axis=0)
-            h1 = np.matmul(self.W1, M) + self.b1  # hidden nodes 1
-            h1 = self.hyper['activ'](h1)
-            h2 = np.matmul(self.W2, h1) + self.b2  # hidden nodes 2
-            res = self.hyper['activ'](h2)  # final reservoir
-            res = np.transpose(res)
+            # compute reservoir from previous log-return and volatility:
+            M = np.stack((X[:, t-1, :], log_s2_prev), axis=0)  # (2,N,K)
+
+            # hidden nodes 1:
+            # matrix multiplication for each regime
+            h1 = np.einsum('HIK,INK->HNK', self.A1, M) + self.b1
+            h1 = self.activ(h1)  # (H,N,K)
+
+            # hidden nodes 2
+            h2 = np.einsum('qHK,HNK->qNK', self.A2, h1) + self.b2  # (q,N,K)
+            res = self.activ(h2)  # final reservoir of shape (q,N,K)
 
             # get volatility from reservoir & readout
-            log_s2_j = np.sum(w*res, axis=1) + w0
-            log_s2_j = np.minimum(100, np.maximum(-100, log_s2_j))
+            log_s2_j = np.einsum('qNK,qNK->qNK', Ws, res) + w0s  # Hadamard
+            log_s2_j = np.einsum('qNK->NK', log_s2_j)  # sum over axis 0
+            log_s2_j = cap(log_s2_j, floor=-100, ceil=100)
 
-        return log_s2_j
+        s_t = np.exp(0.5*log_s2_j)
 
-    def sig(self, t, theta):
+        return s_t
+
+    def sig_vol(self, theta, X, t):
         '''
         compute volatility from the truncated signature of the time-extended
         path of the log-returns, (t, X_t)
         '''
-        pass
+        N = len(theta)
 
-    def rsig_vol(self, t, theta):
+        if t > 0:
+            # time-extended path and its signature:
+            X_tilde = np.vstack([X[0:t], np.arange(0, t, 1)])  # (2,t)
+
+            if self.variant == 'standard':
+                sig = stream2sig(X_tilde.T, self.M)[0:self.q+1]
+            else:
+                sig = stream2logsig(X_tilde.T, 6)[0:self.q+1]
+
+            # compute volatility from weights & signature components:
+            w_names = ['w' + str(j) for j in range(self.q+1)]
+            W = itemgetter(*w_names)(theta)  # (q,N)
+            W = np.array(W)
+            log_s2_t = np.einsum('qN,q->N', W, sig)
+            s_t = np.exp(0.5*log_s2_t)
+            s_t = s_t.reshape(-1, 1)
+        else:
+            s_t = np.full([N, self.K], np.sqrt(self.s2_0))
+
+        return s_t
+
+
+    def rsig_vol(self, theta, X, t):
         '''
         compute volatility from the randomized signature of the time-extended
         path of the log-returns, (t, X_t)
         '''
-        # rSig_0 is random and identical for all particles
-        rsig = np.tile(self.rsig_0.reshape(-1, 1), (1, len(theta)))
-        b1 = np.tile(self.b1.reshape(-1, 1), (1, len(theta)))
-        b2 = np.tile(self.b2.reshape(-1, 1), (1, len(theta)))
-        theta = structured_to_unstructured(theta)
-        theta = np.minimum(np.exp(50), np.maximum(-np.exp(50), theta))
+        N = len(theta)
+        shape0 = [N, self.K]
+        shape = [self.q, N, self.K]
 
-        if self.innov == 'N':
-            w = theta[:, 0:-1]  # weights
-            w0 = theta[:, -1]   # bias term
+        # rSig_0 is identical between particles but not regimes
+        rsig = np.tile(self.rsig_0, [1, N, 1])  # (q,N,K)
+
+        w0s = np.full(shape0, np.nan)
+        Ws = np.full(shape, np.nan)
+        if self.K == 1:
+            w0s[:, 0] = theta['w0']
+            for j in range(self.q):
+                Ws[j, :, 0] = theta['w' + str(j)]
         else:
-            w = theta[:, 0:-2]  # last term is df
-            w0 = theta[:, -2]
+            for k in range(self.K):
+                w0s[:, k] = theta['w0_' + str(k)]
+                for j in range(self.q):
+                    Ws[j, :, k] = theta['w' + str(j) + '_' + str(k)]
 
-        s2_0 = np.var(self.data)  # initial volatility
-        log_s2_j = np.tile(s2_0, len(theta))
-        for j in range(1, t+1):
+        w0s = cap(w0s, floor=-1e20, ceil=1e20)
+        Ws = cap(Ws, floor=-1e20, ceil=1e20)
+
+        if X.ndim == 1:
+            X = X.reshape(1, -1, 1)  # (1,t,1)
+            X = np.tile(X, [N, 1, self.K]) # (N,t,K)
+        # else X has shape (N,t,K) already anyway
+
+        log_s2_j = np.tile(np.log(self.s2_0), [N, self.K])  # (N,K)
+        for j in range(1, t+1):  # (!) replace with functools.reduce()
             log_s2_prev = log_s2_j
 
             # update rSig
-            Z_prev = self.data[j-1] / np.exp(log_s2_prev/2)
-            incr_1 = np.matmul(self.A1, rsig) + b1
-            incr_1 = self.hyper['activ'](incr_1)
-            incr_2 = np.matmul(self.A2, rsig) + b2
-            incr_2 = self.hyper['activ'](incr_2) * Z_prev
+            incr_1 = np.einsum('qpK,pNK->qNK', self.A1, rsig) + self.b1
+            incr_1 = self.activ(incr_1)  # (q,N,K)
+
+            Z_prev = X[:, j-1, :] / np.exp(log_s2_prev/2)  # (N,K)
+            incr_2 = np.einsum('qpK,pNK->qNK', self.A2, rsig) + self.b2  # matmul
+            incr_2 = self.activ(incr_2)  # (q,N,K)
+            incr_2 = np.einsum('qNK,NK->qNK', incr_2, Z_prev)  # Hadamard prod
             rsig += incr_1 + incr_2
 
-            # get volatility from rSig and readout
-            log_s2_j = np.sum(w*np.transpose(rsig), axis=1) + w0
-            log_s2_j = np.minimum(100, np.maximum(-100, log_s2_j))
+            # get volatility from reservoir & rSig
+            log_s2_j = np.einsum('qNK,qNK->qNK', Ws, rsig) + w0s  # Hadamard
+            log_s2_j = np.einsum('qNK->NK', log_s2_j)  # sum over axis 0
+            log_s2_j = cap(log_s2_j, floor=-100, ceil=100)
 
-        return log_s2_j
+        s_t = np.exp(log_s2_j/2)
 
-    def logpyt(self, theta, t):
-        '''
-        for each θ-particle θ^(i), compute log-likelihood of current
-        observation x_t given observations x_{1:t-1} and model parameters θ^(i)
-        '''
-        if self.rc_type == 'elm':
-            log_s2_t = self.elm_vol(t, theta)
-        elif self.rc_type == 'sig':
-            log_s2_t = self.sig_vol(t, theta)
-        elif self.rc_type == 'r_sig':
-            log_s2_t = self.rsig_vol(t, theta)
+        return s_t
 
-        assert not np.isnan(log_s2_t).any(), "NaNs in volatilities"
-        s_t = np.exp(log_s2_t/2)
+    def vol(self, theta, X, t):  # wrapper
 
-        # compute log-likelihood given σ and distribution
-        if self.innov == 'N':
-            return -np.log(s_t) - 1/2*np.log(2*np.pi) - 1/(2*s_t**2)*self.data[t]**2
+        if self.variant == 'elm':
+            s_t = self.elm_vol(theta, X, t)
+        elif self.variant == 'r_sig':
+            s_t = self.rsig_vol(theta, X, t)
+        else:  # variant = t_sig or log_sig
+            s_t = self.sig_vol(theta, X, t)
+
+        return s_t
+
+
+class Guyon:
+    '''
+    Guyon and Lekeufack's (2023) path-dependent volatility model
+
+    '''
+
+    def __init__(self, K):
+
+        self.K = K
+        self.s2_0 = 1  # initial volatility
+
+    def vol(self, theta, X, t):
+
+        N = len(theta)
+        shape = [N, self.K]
+
+        if X.ndim == 1:
+            X = X.reshape(1, -1, 1)  # (1,t,1)
+            X = np.tile(X, [N, 1, self.K]) # (N,t,K)
+        # else X has shape (N,t,K) already anyway (but w different entries
+        # along axes 0 and 2)
+
+        if self.K == 1:
+            omegas = theta['omega'].reshape(shape)
+            alphas = theta['alpha'].reshape(shape)
+            betas = theta['beta'].reshape(shape)
+            a1s = theta['a1'].reshape(shape)
+            a2s = theta['a2'].reshape(shape)
+            d1s = theta['d1'].reshape(shape)
+            d2s = theta['d2'].reshape(shape)
         else:
-            df = structured_to_unstructured(theta)[:, -1]
-            return stats.t.logpdf(self.data[t], loc=0, scale=s_t, df=df)
+            omegas = alphas = betas = np.full(shape, np.nan)
+            a1s = a2s = d1s = d2s = np.full(shape, np.nan)
+            for k in range(self.K):
+                omegas[:, k] = theta['omega_' + str(k)]
+                alphas[:, k] = theta['alpha_' + str(k)]
+                betas[:, k] = theta['beta_' + str(k)]
+                a1s[:, k] = theta['a1_' + str(k)]
+                a2s[:, k] = theta['a2_' + str(k)]
+                d1s[:, k] = theta['d1_' + str(k)]
+                d2s[:, k] = theta['d2_' + str(k)]
+
+        # transform/cap parameters
+        omegas = cap(omegas, floor=0.)
+        alphas = cap(alphas, floor=0.)
+        betas = cap(betas, floor=0.)
+        a1s = cap(a1s, floor=1.)
+        a2s = cap(a2s, floor=1.)
+        d1s = cap(d1s, floor=1.)
+        d2s = cap(d2s, floor=1.)
+
+        # kernel parameters must be 3D for vectorization
+        a1s = a1s[:, :, np.newaxis]
+        a2s = a2s[:, :, np.newaxis]
+        d1s = d1s[:, :, np.newaxis]
+        d2s = d2s[:, :, np.newaxis]
+
+        if t > 0:
+            # grid of all previous time stamps
+            tp_grid = np.arange(0, t, 1)
+            # trend kernel weights (k1[i, j, k] = weight of i-th particle,
+            # j-th regime, k-th time lag)
+            k1 = tspl(t=t, tp=tp_grid, alpha=a1s, delta=d1s)  # (N,K,t)
+            # volatility kernel weights:
+            k2 = tspl(t=t, tp=tp_grid, alpha=a2s, delta=d2s)  # (N,K,t)
+            k1 = np.swapaxes(k1, 1, 2)  # (N,t,K)
+            k2 = np.swapaxes(k2, 1, 2)  # (N,t,K)
+            trend = np.sum(k1 * X[:, 0:t, :], axis=1)
+            volat = np.sqrt(np.sum(k2 * X[:, 0:t, :]**2, axis=1))
+
+            s_t = omegas + alphas*trend + betas*volat
+            s_t = cap(s_t, floor=1e-50, ceil=1e50)
+
+        elif t == 1:
+            trend = X[:, 0, :]
+            volat = X[:, 0, :]
+            s_t = omegas + alphas*trend + betas*volat
+
+        else:  # t == 0:
+            s_t = np.sqrt(self.s2_0)
+            s_t = np.tile(s_t, shape)
+
+        return s_t
+
+
+class HybridHMM(HMM):
+    '''
+    Student t HMM which automatically becomes Gaussian (if df=None) or Cauchy
+    (if df=1) HMM
+
+    Used in Markov-switching models to compute regime probabilities given
+    parameters
+    '''
+
+    def PY(self, t, xp, x):
+        s_t = self.model.vol(theta=self.theta, X=self.X, t=self.t).flatten()
+        s_t = cap(s_t, 1e-50, 1e50)
+        return F_innov(scale=s_t[x], df=self.df)

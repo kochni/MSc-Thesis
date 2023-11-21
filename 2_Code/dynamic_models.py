@@ -5,281 +5,532 @@ import numpy as np
 import scipy
 
 from particles.state_space_models import StateSpaceModel
-from particles import distributions as dists
+from particles.distributions import Normal, Student, Dirac, Mixture
 
-# documentation:
-# https://particles-sequential-monte-carlo-in-python.readthedocs.io/en/latest/_autosummary/particles.state_space_models.html#module-particles.state_space_models
+from operator import itemgetter
 
-# source code:
-# https://github.com/nchopin/particles/blob/master/particles
+# from helpers import F_innov, cap
 
 
-class MSGARCH(StateSpaceModel):
+class PiecewiseConst(StateSpaceModel):
     '''
-    Markov-switching GARCH model, i.e. process of the form
+    Stochastic volatility model with (piecewise) constant volatility:
 
-    Parameters:
-    -----------
+        V_t = V_{t-1} + J_t
+
+    Note: only interesting if jumps in volatility specified, else use DetVol
 
     '''
 
     default_params = {
-        'variant': 'basic',
-        'innov_X': 'N',
-        'innov_V': 'N'
+        'df': None, 'df_X': None, 'df_V': None,
+        'phi_X': None, 'lambda_X': None,
+        'phi_V': None, 'lambda_V': None
         }
 
+    def get_params(self):
+        ''' extract all parameters & do capping/transformations '''
+        theta = {}
+
+        # innovation parameters:
+        df_X = self.df_X if self.df_X is not None else self.df
+        df_V = self.df_V if self.df_V is not None else self.df
+        theta['df_X'] = cap(df_X, floor=2.+1e-10)
+        theta['df_V'] = cap(df_V, floor=2.+1e-10)
+        # --> if only 'df' specified, df_X = df_V = df;
+        # if no df arguments specified, df_X = df_V = None
+
+        # jump parameters:
+        theta['lambda_X'] = cap(self.lambda_X, floor=0., ceil=1.)
+        theta['lambda_V'] = cap(self.lambda_V, floor=0., ceil=1.)
+        theta['phi_X'] = cap(self.phi_X, floor=0.)
+        theta['phi_V'] = cap(self.phi_V, floor=0.)
+
+        return theta
+
     def PX0(self):
-        '''
-        distribution of initial latent state, K_0(V_1)
-        '''
-        p_00 = self.p_00
-        p_01 = 1 - p_00
-        p_10 = self.p_10
-        p_11 = 1 - p_10
-
-        p = p_10/(p_10+p_01)
-
-        return dists.Binomial(n=1, p=p)
+        theta = self.get_params()
+        return F_innov(sd=theta['phi_V'], df=theta['df_V'])
 
     def PX(self, t, xp):
-        '''
-        transition kernel of latent states, K(V_t | V_{t-1})
+        theta = self.get_params()
+        xp = cap(xp, floor=-50., ceil=50.)
 
-        Note: 'xp' is r_{t-1}
-        '''
-        p = (1-xp)*self.p_00 + xp*self.p_10
-
-        return dists.Binomial(n=1, p=p)
+        return Mixture([1.-theta['lambda_V'], theta['lambda_V']],
+                       Dirac(loc=xp),
+                       F_innov(mean=xp, sd=theta['phi_V'], df=theta['df_X'])
+                       )
 
     def PY(self, t, xp, x, data):
-        '''
-        conditional distribution of observations, P(X_t | X_{t-1}, V_t)
+        theta = self.get_params()
+        x = cap(x, floor=-50., ceil=50.)
 
-        Note: 'x' is r_t
-        '''
-        omega = (1-x)*self.omega_0 + x*self.omega_1
-        alpha = (1-x)*self.alpha_0 + x*self.alpha_1
-        beta = (1-x)*self.beta_0 + x*self.beta_1
+        if theta['phi_X'] is None:
+            return F_innov(sd=np.exp(x/2), df=theta['df_X'])
 
-        s2_j = np.tile(1, len(omega))  # initial volatility
+        else:
+            sd_jump = np.sqrt(np.exp(x) + theta['phi_X'])
+            return Mixture([1.-theta['lambda_X'], theta['lambda_X']],
+                           F_innov(sd=np.exp(x/2), df=theta['df_X']),
+                           F_innov(sd=sd_jump, df=theta['df_X'])
+                           )
 
-        for j in range(1, t+1):
-            s2_prev = s2_j
-            s2_j = omega + alpha*data[j-1]**2 + beta*s2_prev
-
-        s2_t = np.maximum(s2_j, 1e-10)
-
-        return dists.Normal(loc=0, scale=s2_t)
-
+    # methods for defining Guided PF:
 
     def _xhat(self, xst, s, yt):
-        return xst + 0.5 * s**2 * (yt ** 2 * np.exp(-xst) - 1.0)
+        pass
 
     def proposal0(self, data):
-        '''
-        proposal distribution of inital latent state, nu_0(V_1)
-        '''
-        return dists.Normal(loc=self._xhat(0, 1, data[0]),
-                            scale=1)
+        return F_innov(df=5)
 
     def proposal(self, t, xp, data):
-        '''
-        conditional proposal distribution of new latent state,
-        nu(V_t | V_{t-1}, X_{1:t})
-        '''
-        xi = self.xi
-
-        return dists.Normal(loc=self._xhat(self.EXt(xp), xi, data[t]),
-                            scale=xi)
+        return F_innov(mean=xp, df=5)
 
 
 class StochVol(StateSpaceModel):
     '''
-    Stochastic Volatility model, i.e. process of the form
-        X_t = V_t·Z_t
-        log(V_t^2) = ω·(1-α) + α·log(V_t^2) + ξ·U_t
+    Canonical stochastic volatility model:
 
-    Parameters:
-    -----------
-    variant: string
-        specific model; one of 'basic', 'heston', and 'sabr'.
+        log(V_t^2) = ω·(1-α) + α·log(V_{t-1}^2) + ξ·Z_t
 
-    innov_X: string
-        innovation distribution of observations; one of 'N' (for Gaussian)
-        and 't' (for Student t).
-
-    innov_V: string
-        innovation distribution of volatilities; one of 'N' (for Gaussian)
-        and 't' (for Student t).
     '''
 
+    # by default, single Gaussian regime without jumps
     default_params = {
-        'variant': 'basic',
-        'innov_X': 'N',
-        'innov_V': 'N'
+        'p_0': None,
+        'omega': None, 'alpha': None, 'xi': None,
+        'omega_0': None, 'alpha_0': None, 'xi_0': None,
+        'omega_1': None, 'alpha_1': None, 'xi_1': None,
+        'df': None,'df_X': None, 'df_V': None,
+        'phi_X': None, 'lambda_X': None,
+        'phi_V': None, 'lambda_V': None
         }
 
-    def PX0(self):
-        '''
-        distribution of initial latent state, K_0(V_1)
-        '''
-        omega = self.omega
-        omega = np.minimum(np.exp(50), np.maximum(-np.exp(50), omega))
+    def get_params(self):
+        ''' extract all parameters & do necessary capping '''
+        theta = {}
 
-        if self.innov_X == 'N':
-            return dists.Normal(loc=omega, scale=1)
+        theta['p_0'] = cap(self.p_0, floor=0., ceil=1.)
+        if theta['p_0'] is None:
+            theta['omega'] = self.omega
+            theta['alpha'] = cap(self.alpha, floor=0., ceil=1.-1e-10)
+            theta['xi'] = cap(self.xi, floor=1e-20)
         else:
-            df = self.df
-            return dists.Student(loc=omega, scale=1, df=df)
+            theta['omega_0'] = self.omega_0
+            theta['omega_1'] = self.omega_1
+            theta['alpha_0'] = cap(self.alpha_0, floor=0., ceil=1.-1e-10)
+            theta['alpha_1'] = cap(self.alpha_1, floor=0., ceil=1.-1e-10)
+            theta['xi_0'] = cap(self.xi_0, floor=1e-20)
+            theta['xi_1'] = cap(self.xi_1, floor=1e-20)
 
-    def EXt(self, xp):
-        '''
-        conditional expectation of latent state, E[x_t|x_{t-1}]
-        '''
-        omega = self.omega
-        alpha = self.alpha
+        # innovation parameters:
+        df_X = self.df_X if self.df_X is not None else self.df
+        df_V = self.df_V if self.df_V is not None else self.df
+        theta['df_X'] = cap(df_X, floor=2.+1e-10)
+        theta['df_V'] = cap(df_V, floor=2.+1e-10)
+        # --> if only 'df' specified, df_X = df_V = df;
+        # if no df arguments specified, df_X = df_V = None
 
-        return omega*(1 - alpha) + alpha*xp
+        # jump parameters:
+        theta['lambda_X'] = cap(self.lambda_X, floor=0., ceil=1.)
+        theta['lambda_V'] = cap(self.lambda_V, floor=0., ceil=1.)
+        theta['phi_X'] = cap(self.phi_X, floor=0.)
+        theta['phi_V'] = cap(self.phi_V, floor=0.)
+
+        return theta
+
+    def PX0(self):
+        theta = self.get_params()
+        if theta['p_0'] is None:
+            return F_innov(mean=theta['omega'],
+                           sd=theta['xi']/np.sqrt(1.-theta['alpha']**2),
+                           df=theta['df_V'])
+        else:
+            p_0 = theta['p_0']
+            dist_0 = F_innov(mean=theta['omega_0'],
+                             sd=theta['xi_0']/np.sqrt(1.-theta['alpha_0']**2),
+                             df=theta['df_V'])
+            dist_1 = F_innov(mean=theta['omega_1'],
+                             sd=theta['xi_1']/np.sqrt(1.-theta['alpha_1']**2),
+                             df=theta['df_V'])
+            return Mixture([p_0, 1.-p_0], dist_0, dist_1)
+
+    def EXt(self, rt=None, xp=None):
+        ''' E[log(V_t^2) | log(V_{t-1}^2)] '''
+        theta = self.get_params()
+        xp = cap(xp, floor=-50., ceil=50.)
+
+        if rt is None:
+            omega = theta['omega']
+            alpha = theta['alpha']
+        else:
+            omega = theta['omega_' + str(rt)]
+            alpha = theta['alpha_' + str(rt)]
+
+        return (1.-alpha)*omega + alpha*xp
 
     def PX(self, t, xp):
-        '''
-        transition kernel of latent states, K(V_t | V_{t-1})
+        theta = self.get_params()
+        xp = cap(xp, floor=-50., ceil=50.)
 
-        Note: 'xp' is log(V_{t-1}^2), 'xi' is vol-of-vol
-        '''
-        xp = np.minimum(50, np.maximum(-50, xp))
-        alpha = self.alpha
-        xi = self.xi
+        # mix over regimes and jumps:
+        if theta['p_0'] is None:  # single regime
+            if theta['phi_V'] is None:  # no jumps
+                return F_innov(mean=self.EXt(xp=xp), sd=theta['xi'],
+                               df=theta['df_V'])
+            else:  # jumps
+                dist_nojmp = F_innov(mean=self.EXt(xp=xp), sd=theta['xi'],
+                                     df=theta['df_V'])
+                sd_jmp = np.sqrt(theta['xi']**2 + theta['phi_V'])
+                dist_jmp = F_innov(mean=self.EXt(xp=xp), sd=sd_jmp,
+                                   df=theta['df_V'])
+                lambd = theta['lambda_V']
+                return Mixture([(1.-lambd), lambd], dist_nojmp, dist_jmp)
 
-        if self.innov_V == 'N':
-            return dists.Normal(loc=self.EXt(xp), scale=xi)
-        else:
-            df = self.df
-            return dists.Student(loc=self.EXt(xp), scale=xi, df=df)
+        else:  # 2 regimes
+            p_0 = theta['p_0']
+            if theta['phi_V'] is None:  # no jumps
+                dist_0 = F_innov(mean=self.EXt(0, xp), sd=theta['xi_0'],
+                                 df=theta['df_V'])
+                dist_1 = F_innov(mean=self.EXt(1, xp), sd=theta['xi_1'],
+                                 df=theta['df_V'])
+                return Mixture([p_0, 1.-p_0], dist_0, dist_1)
+            else:  # jumps
+                dist_0_nj = F_innov(mean=self.EXt(0, xp), sd=theta['xi_0'],
+                                    df=theta['df_V'])
+                dist_1_nj = F_innov(mean=self.EXt(1, xp), sd=theta['xi_1'],
+                                    df=theta['df_V'])
+                lambd = theta['lambda_V']
+                sd_jmp_0 = np.sqrt(theta['xi_0']**2 + theta['phi_0'])
+                sd_jmp_1 = np.sqrt(theta['xi_1']**2 + theta['phi_1'])
+                dist_0_j = F_innov(mean=self.EXt(0, xp), sd=sd_jmp_0,
+                                   df=theta['df_V'])
+                dist_1_j = F_innov(mean=self.EXt(1, xp), sd=sd_jmp_1,
+                                   df=theta['df_V'])
+                return Mixture([p_0*(1.-lambd), (1.-p_0)*(1.-lambd),
+                                p_0*lambd, (1.-p_0)*lambd],
+                               dist_0_nj, dist_1_nj, dist_0_j, dist_1_j)
 
     def PY(self, t, xp, x, data):
-        '''
-        conditional distribution of observations, P(X_t | X_{t-1}, V_t)
+        theta = self.get_params()
+        x = cap(x, floor=-50., ceil=50.)
 
-        Note: 'x' is log(V_t^2), 'xp' is log(V_{t-1}^2), 'xi' is vol-of-vol
-        '''
-        x = np.minimum(50, np.maximum(-50, x))
+        # regimes considered fixed at this point, hence only mix over jumps:
+        if theta['phi_X'] is None:  # no jumps
+            return F_innov(sd=np.exp(.5*x), df=theta['df_X'])
+        else:  # jumps
+            dist_nojmp = F_innov(sd=np.exp(.5*x), df=theta['df_X'])
+            sd_jmp = np.sqrt(np.exp(x) + theta['phi_X'])
+            dist_jmp = F_innov(sd=sd_jmp, df=theta['df_X'])
+            lambd = theta['lambda_X']
+            return Mixture([(1.-lambd), lambd], dist_nojmp, dist_jmp)
 
-        if self.innov_X == 'N':
-            return dists.Normal(loc=0, scale=np.exp(x/2))
-        else:
-            df = self.df
-            return dists.Student(loc=0, scale=np.exp(x/2), df=df)
+    # methods for Guided PF:
 
     def _xhat(self, xst, s, yt):
         return xst + 0.5 * s**2 * (yt ** 2 * np.exp(-xst) - 1.0)
 
     def proposal0(self, data):
-        '''
-        proposal distribution of inital latent state, nu_0(V_1)
-        '''
-        return dists.Normal(loc=self._xhat(0, 1, data[0]),
-                            scale=1)
+        return F_innov(mean=self._xhat(0, 1, data[0]), sd=1)
 
     def proposal(self, t, xp, data):
-        '''
-        conditional proposal distribution of new latent state,
-        nu(V_t | V_{t-1}, X_{1:t})
-        '''
-        xi = self.xi
-
-        return dists.Normal(loc=self._xhat(self.EXt(xp), xi, data[t]),
-                            scale=xi)
+        return F_innov(mean=self._xhat(self.EXt(xp), self.xi, data[t]),
+                       sd=self.xi)
 
 
 class Heston(StateSpaceModel):
     '''
-    Heston stochastic volatility model, i.e. process of the form
-        X_t = V_t·Z_t
+    Heston model:
 
+        log(V_t^2) = log(V_{t-1}^2) + κ·(ν/V_{t-1}^2 - 1) - 1/2·ξ^2/V_{t-1}^2
+                     + ξ/V_{t-1}·Z_t
 
-    Parameters:
-    -----------
-    variant: string
-        specific model; one of 'basic', 'heston', and 'sabr'.
-
-    innov_X: string
-        innovation distribution of observations; one of 'N' (for Gaussian)
-        and 't' (for Student t).
-
-    innov_V: string
-        innovation distribution of volatilities; one of 'N' (for Gaussian)
-        and 't' (for Student t).
     '''
 
+    # by default, single Gaussian regime without jumps
     default_params = {
-        'variant': 'basic',
-        'innov_X': 'N',
-        'innov_V': 'N'
+        'p_0': None,                                  # regime probabilities
+        'nu': None, 'kappa': None, 'xi': None,        #
+        'nu_0': None, 'kappa_0': None, 'xi_0': None,  # main model parameters
+        'nu_1': None, 'kappa_1': None, 'xi_1': None,  #
+        'df': None,'df_X': None, 'df_V': None,        # innovations
+        'phi_X': None, 'lambda_X': None,
+        'phi_V': None, 'lambda_V': None
         }
 
+    def get_params(self):
+        ''' extract all parameters & do necessary capping '''
+        theta = {}
+
+        theta['p_0'] = cap(self.p_0, floor=0., ceil=1.)
+        if theta['p_0'] is None:
+            theta['nu'] = self.nu
+            theta['kappa'] = cap(self.kappa, floor=0., ceil=1.-1e-10)
+            theta['xi'] = cap(self.xi, floor=1e-20)
+        else:
+            theta['nu_0'] = self.nu_0
+            theta['nu_1'] = self.nu_1
+            theta['kappa_0'] = cap(self.kappa_0, floor=0., ceil=1.-1e-10)
+            theta['kappa_1'] = cap(self.kappa_1, floor=0., ceil=1.-1e-10)
+            theta['xi_0'] = cap(self.xi_0, floor=1e-20)
+            theta['xi_1'] = cap(self.xi_1, floor=1e-20)
+
+        # innovation parameters:
+        df_X = self.df_X if self.df_X is not None else self.df
+        df_V = self.df_V if self.df_V is not None else self.df
+        theta['df_X'] = cap(df_X, floor=2.+1e-10)
+        theta['df_V'] = cap(df_V, floor=2.+1e-10)
+        # --> if only 'df' specified, df_X = df_V = df;
+        # if no df arguments specified, df_X = df_V = None
+
+        # jump parameters:
+        theta['lambda_X'] = cap(self.lambda_X, floor=0.)
+        theta['lambda_V'] = cap(self.lambda_V, floor=0.)
+        theta['phi_X'] = cap(self.phi_X, floor=0.)
+        theta['phi_V'] = cap(self.phi_V, floor=0.)
+
+        return theta
+
+    def EXt(self, rt=None, xp=None):
+        ''' E[log(V_t^2) | log(V_{t-1}^2)] '''
+        theta = self.get_params()
+        xp = cap(xp, floor=-50., ceil=50.)
+
+        if rt is None:
+            nu = theta['nu']
+            kappa = theta['kappa']
+            xi = theta['xi']
+        else:
+            nu = theta['nu_' + str(rt)]
+            kappa = theta['kappa_' + str(rt)]
+            xi = theta['xi_' + str(rt)]
+
+        return xp + kappa*(nu*np.exp(-xp) - 1.) - .5*xi**2 * np.exp(-xp)
+
+    def SDXt(self, rt=None, xp=None):
+        ''' SD[log(V_t^2) | log(V_{t-1}^2)] '''
+        theta = self.get_params()
+        xp = cap(xp, floor=-50., ceil=50.)
+
+        if rt is None:
+            sd = theta['xi'] * np.exp(-0.5*xp)
+        else:
+            sd = theta['xi_' + str(rt)] * np.exp(-0.5*xp)
+
+        sd = cap(sd, floor=1e-50, ceil=1e50)
+        return sd
+
     def PX0(self):
-        '''
-        distribution of initial latent state, K_0(V_1)
-        '''
-        nu = self.nu  # long-run volatility
-        xi = self.xi  # vol-of-vol
-
-        return dists.Normal(loc=nu, scale=xi)
-
-    def EXt(self, xp):
-        '''
-        conditional expectation of latent state, E[x_t|x_{t-1}]
-        '''
-        kappa = self.kappa  # speed of mean reversion
-        nu = self.nu        # long-run volatility
-        xi = self.xi        # vol-of-vol
-
-        return xp + kappa*(nu/np.exp(xp) - 1) - 0.5*xi**2 / np.exp(xp)
+        theta = self.get_params()
+        if theta['p_0'] is None:
+            return F_innov(mean=theta['nu'], sd=theta['xi'],
+                           df=theta['df_V'])
+        else:
+            p_0 = theta['p_0']
+            dist_0 = F_innov(mean=theta['nu_0'], sd=theta['xi_0'],
+                             df=theta['df_V'])
+            dist_1 = F_innov(mean=theta['nu_1'], sd=theta['xi_1'],
+                             df=theta['df_V'])
+            return Mixture([p_0, 1.-p_0], dist_0, dist_1)
 
     def PX(self, t, xp):
-        '''
-        transition kernel of latent states, K(V_t | V_{t-1})
+        theta = self.get_params()
+        xp = cap(xp, floor=-50., ceil=50.)
 
-        Note: 'xp' is log(V_{t-1}^2), 'xi' is vol-of-vol
-        '''
-        xp = np.minimum(50, np.maximum(-50, xp))
-        kappa = self.kappa  # speed of volatility reversion
-        nu = self.nu        # mean volatility level
-        xi = self.xi        # vol-of-vol
+        # mix over regimes and jumps:
+        if theta['p_0'] is None:  # single regime
+            if theta['phi_V'] is None:  # no jumps
+                return F_innov(mean=self.EXt(xp=xp), sd=self.SDXt(xp=xp),
+                               df=theta['df_V'])
+            else:  # jumps
+                dist_nojmp = F_innov(mean=self.EXt(xp=xp), sd=self.SDXt(xp=xp),
+                                     df=theta['df_V'])
+                sd_jmp = np.sqrt(self.SDXt(xp=xp)**2 + theta['phi_V'])
+                dist_jmp = F_innov(mean=self.EXt(xp=xp), sd=sd_jmp,
+                                   df=theta['df_V'])
+                lambd = theta['lambda_V']
+                return Mixture([(1.-lambd), lambd], dist_nojmp, dist_jmp)
 
-        return dists.Normal(loc=self.EXt(xp),
-                            scale=xi/np.exp(xp/2))
+        else:  # 2 regimes
+            p_0 = theta['p_0']
+            if theta['phi_V'] is None:  # no jumps
+                dist_0 = F_innov(mean=self.EXt(0, xp), sd=self.SDXt(0, xp),
+                                 df=theta['df_V'])
+                dist_1 = F_innov(mean=self.EXt(1, xp), sd=self.SDXt(1, xp),
+                                 df=theta['df_V'])
+                return Mixture([p_0, 1.-p_0], dist_0, dist_1)
+
+            else:  # jumps
+                dist_0_nj = F_innov(mean=self.EXt(0, xp), sd=self.SDXt(0, xp),
+                                    df=theta['df_V'])
+                dist_1_nj = F_innov(mean=self.EXt(1, xp), sd=self.SDXt(1, xp),
+                                    df=theta['df_V'])
+
+                lambd = theta['lambda_V']
+                sd_jmp_0 = np.sqrt(self.SDXt(0, xp)**2 + theta['phi_0'])
+                sd_jmp_1 = np.sqrt(self.SDXt(1, xp)**2 + theta['phi_1'])
+                dist_0_j = F_innov(mean=self.EXt(0, xp), sd=sd_jmp_0,
+                                   df=theta['df_V'])
+                dist_1_j = F_innov(mean=self.EXt(1, xp), sd=sd_jmp_1,
+                                   df=theta['df_V'])
+                return Mixture([p_0*(1.-lambd), p_1*(1.-lambd),
+                                p_0*lambd, p_1*lambd],
+                               dist_0_nj, dist_1_nj, dist_0_j, dist_1_j)
 
     def PY(self, t, xp, x, data):
-        '''
-        conditional distribution of observations, P(X_t | X_{t-1}, V_t)
+        theta = self.get_params()
+        x = cap(x, floor=-50., ceil=50.)
 
-        Note: 'x' is log(V_t^2), 'xp' is log(V_{t-1}^2), 'xi' is vol-of-vol
-        '''
-        x = np.minimum(50, np.maximum(-50, x))
+        # regimes fixed at this point, hence only mix over jumps:
+        if theta['phi_X'] is None:  # no jumps
+            return F_innov(sd=np.exp(.5*x), df=theta['df_X'])
+        else:  # jumps
+            dist_nojmp = F_innov(sd=np.exp(.5*x), df=theta['df_X'])
+            sd_jmp = np.sqrt(np.exp(x) + theta['phi_X'])
+            dist_jmp = F_innov(sd=sd_jmp, df=theta['df_X'])
+            lambd = theta['lambda_X']
+            return Mixture([(1.-lambd), lambd], dist_nojmp, dist_jmp)
 
-        return dists.Normal(loc=0, scale=np.exp(x/2))
+    # methods for defining Guided PF:
 
     def _xhat(self, xst, s, yt):
         return xst + 0.5 * s**2 * (yt ** 2 * np.exp(-xst) - 1.0)
 
     def proposal0(self, data):
-        '''
-        proposal distribution of inital latent state, nu_0(V_1)
-        '''
-        return dists.Normal(loc=self._xhat(0, 1, data[0]),
-                            scale=1)
+        return F_innov(mean=self._xhat(0, 1, data[0]),
+                      sd=1)
 
     def proposal(self, t, xp, data):
-        '''
-        conditional proposal distribution of new latent state,
-        nu(V_t | V_{t-1}, X_{1:t})
-        '''
-        xi = self.xi
-        xi = np.minimum(np.exp(50), np.maximum(-np.exp(50), xi))
-        xp = np.minimum(50, np.maximum(-50, xp))
+        return F_innov(mean=self._xhat(self.EXt(xp), self.xi, data[t]),
+                      sd=self.xi)
 
-        return dists.Normal(loc=self._xhat(self.EXt(xp), xi, data[t]),
-                            scale=xi)
+
+class NeuralSV(StateSpaceModel):
+    '''
+    Reservoir computer for stochastic volatility:
+
+        log(V_t^2) = ℓ(Res1_t) + ℓ(Res2_t)·Z_t
+
+        where Res1_t, Res2_t are two separate random projections of the past
+        returns X_{t-1} and volatilities V_{t-1} and ℓ(·) is a linear map
+
+    '''
+
+    # change stuff here to modify model:
+    default_params = {
+        'vol_drift': 'heston',  # 'basic', 'heston', or 'neural
+        'vol_vol': 'neural',     # same; 'basic' = constant, 'heston' =
+                                # exponentially decreasing
+        'q': 5,  # dim of reservoir; must match w dim of A2· and b2· below!
+        'A11': np.random.normal(size=[20, 2]),  #
+        'A12': np.random.normal(size=[20, 2]),  #
+        'b11': np.random.normal(size=[20, 1]),  #
+        'b12': np.random.normal(size=[20, 1]),  # inner NN weights
+        'A21': np.random.normal(size=[5, 20]),  #
+        'A22': np.random.normal(size=[5, 20]),  #
+        'b21': np.random.normal(size=[5, 1]),   #
+        'b22': np.random.normal(size=[5, 1]),    #
+        'df': None, 'df_X': None, 'df_V': None
+        }
+
+    def get_params(self):
+        theta = {}
+        if self.vol_drift == 'neural':
+            for j in range(self.q+1):
+                theta['v' + str(j)] = getattr(self, 'v'+str(j))
+        elif self.vol_drift == 'basic':
+            theta['omega'] = self.omega
+            theta['alpha'] = cap(self.alpha, floor=0., ceil=1.-1e-10)
+            theta['xi'] = cap(self.xi, floor=1e-20)
+        else:  # Heston
+            theta['nu'] = self.nu
+            theta['kappa'] = cap(self.kappa, floor=0., ceil=1.-1e-10)
+            theta['xi'] = cap(self.xi, floor=1e-20)
+
+        if self.vol_vol == 'neural':
+            for j in range(self.q+1):
+                theta['w' + str(j)] = getattr(self, 'w'+str(j))
+        else:  # Basic SV or Heston
+            theta['xi'] = cap(self.xi, floor=1e-20)
+
+        # if only 'df' specified, df_X = df_V = df;
+        # if no df arguments specified, df_X = df_V = None
+        df_X = self.df_X if self.df_X is not None else self.df
+        df_V = self.df_V if self.df_V is not None else self.df
+        theta['df_X'] = cap(df_X, floor=2.+1e-10)
+        theta['df_V'] = cap(df_V, floor=2.+1e-10)
+
+        return theta
+
+    def Res(self, factor, t, xp=0.):
+        if t > 0:
+            rp = np.full(len(xp), data[t-1])
+        else:
+            rp = np.array(0.)
+            xp = np.array(1.)
+
+        x = np.vstack([rp, xp])  # (2,Nx)
+        if factor == 'drift':
+            A1, b1, A2, b2 = self.A11, self.b11, self.A21, self.b21
+        else:
+            A1, b1, A2, b2 = self.A12, self.b12, self.A22, self.b22
+
+        h1 = np.einsum('HI,IN->HN', A1, x) + b1
+        h1 = sigmoid(h1)
+        h2 = np.einsum('qH,HN->qN', A2, h1) + b2
+        h2 = sigmoid(h2)
+        return h2  # (q,Nx)
+
+    def EXt(self, t, xp=0.):
+        theta = self.get_params()
+        xp = cap(xp, floor=-50., ceil=50.)
+
+        if self.vol_drift == 'neural':
+            w_names = ['v' + str(j) for j in range(1, self.q+1)]
+            W = itemgetter(*w_names)(theta)  # (q,)
+            W = np.array(W)
+            Res = self.Res('drift', t, xp)  # (q,Nx)
+            EXt = np.einsum('q,qN->N', W, Res) + theta['v0']
+
+        elif self.vol_drift == 'basic':
+            EXt = (1.-theta['alpha']) * theta['omega'] + theta['alpha'] * xp
+
+        else:
+            EXt = (xp + theta['kappa']*(theta['nu'] * np.exp(-xp) - 1.) -
+                    0.5*theta['xi']**2 * np.exp(-xp))
+
+        return EXt
+
+    def SDXt(self, t, xp=0.):  # same as EXt but with w and Res2
+        theta = self.get_params()
+
+        if self.vol_vol == 'neural':
+            w_names = ['w' + str(j) for j in range(1, self.q+1)]
+            W = itemgetter(*w_names)(theta)  # (q,)
+            W = np.array(W)
+            Res = self.Res('diffus', t, xp)  # (q,Nx)
+            SDXt = np.einsum('q,qN->N', W, Res) + theta['w0']
+
+        elif self.vol_vol == 'basic':
+            SDXt = theta['xi']
+
+        else:
+            SDXt = theta['xi'] * np.exp(-0.5*xp)
+
+        SDXt = cap(SDXt, floor=1e-20, ceil=1e20)
+        return SDXt
+
+    def PX0(self):
+        theta = self.get_params()
+        return F_innov(mean=self.EXt(t=0), sd=self.SDXt(t=0),
+                       df=theta['df_V'])
+
+    def PX(self, t, xp):
+        theta = self.get_params()
+        return F_innov(mean=self.EXt(t, xp), sd=self.SDXt(t, xp),
+                       df=theta['df_V'])
+
+    def PY(self, t, xp, x, data):
+        theta = self.get_params()
+        x = cap(x, floor=-50., ceil=50.)
+        return F_innov(sd=np.exp(0.5*x), df=theta['df_X'])
