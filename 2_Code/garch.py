@@ -151,18 +151,19 @@ class GARCH:
             σ^2_t = ω + (α + γ·1(X_{t-1}>0))·X_{t-1}^2 + β·σ_{t-1}^2
 
         '''
-        shape = [len(theta), self.K]
+        N = len(theta)
+        K = self.K
 
         if self.K == 1:
-            omegas = theta['omega'].reshape(shape)
-            alphas = theta['alpha'].reshape(shape)
-            betas = theta['beta'].reshape(shape)
-            gammas = theta['gamma'].reshape(shape)
+            omegas = theta['omega'].reshape(N, K)
+            alphas = theta['alpha'].reshape(N, K)
+            betas = theta['beta'].reshape(N, K)
+            gammas = theta['gamma'].reshape(N, K)
         else:
-            omegas = np.full(shape, np.nan)
-            alphas = np.full(shape, np.nan)
-            betas = np.full(shape, np.nan)
-            gammas = np.full(shape, np.nan)
+            omegas = np.full([N, K], np.nan)
+            alphas = np.full([N, K], np.nan)
+            betas = np.full([N, K], np.nan)
+            gammas = np.full([N, K], np.nan)
             for k in range(self.K):
                 omegas[:, k] = theta['omega_' + str(k)]
                 alphas[:, k] = theta['alpha_' + str(k)]

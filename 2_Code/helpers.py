@@ -7,187 +7,64 @@ import numpy as np
 from scipy import stats
 import matplotlib.pyplot as plt
 
-from particles import distributions
+from particles.distributions import *
+from collections import OrderedDict
 from numpy.lib.recfunctions import structured_to_unstructured  # to make structured array useful again
 from itertools import chain
 
-from scipy.optimize import brentq
 
-
-def F_innov(mean=0., sd=1., **theta_F):
+def cap_params(theta):
     '''
-    Wrapper function for innovation distributions, i.e. with mean 0 sd 1.
-    Reverts to simplest distribution whenever possible for performance gains:
-        - if no additional parameters specified (besides mean & sd), returns
-          Gaussian
-        - if df specified, returns Student t with df degrees of freedom
-        - if shape, tail, skew specified, returns Generalized Hyperbolic
+    Parameters
+    ----------
+    theta: Structured array
 
     '''
-    if theta_F['tail'] is None:
-        return Normal(loc=mean, scale=sd)
-    elif theta_F['shape'] is None:
-        _, v = stats.t.stats(df=theta_F['tail'])
-        return Student(scale=sd/np.sqrt(v), df=theta_F['tail'])
-    else:
-        m, v = stats.genhyperbolic.stats(p=theta_F['tail'], a=theta_F['shape'],
-                                         b=theta_F['skew'])
-        return GenHyp(loc=-m/np.sqrt(v), scale=sd/np.sqrt(v), tail=theta_F['tail'],
-                      shape=theta_F['shape'], skew=theta_F['skew'])
+    params_names = theta.dtype.names
 
+    # Canonical SV
+    if 'alpha' in params_names:
+        pass
+    elif 'alpha_0' in params_names:
+        pass
 
-def mix_cdf(x, probs, mus=0., sigmas=1., **theta_F):
-    '''
-    CDF of a mixture of the innovation distribution
+    # Heston model
+    elif 'nu' in params_names:
+        pass
+    elif 'nu_0' in params_names:
+        pass
 
-    Parameters:
-    -----------
-    q: array
-        quantiles to be returned.
-    probs: array
-        weights of mixture components.
-    mus: array
-        means of mixture components.
-    sigmas: array
-        standard deviations of mixture components.
-    dfs: array
-        degrees of freedoms of mixture components.
-
-    '''
-
-    # CDF of mixture distribution is weighted sum of individual CDFs
-    return (probs * F_innov(mus, sigmas, **theta_F).cdf(x)).sum()
-
-
-def abs_cdf(x, cdf):
-    '''
-    CDF of the absolute value of a random variable
-
-    '''
-    return cdf(x) - cdf(-x)
-
-
-def sq_cdf(x, cdf):
-    '''
-    CDF of the square of a random variable from distribution 'dist'
-
-    '''
-    return cdf(np.sqrt(x)) - cdf(-np.sqrt(x))
-
-
-def pos_cdf(x, cdf):
-    '''
-    CDF of positive part of a random variable, (X)_+ = max(X, 0)
-
-    '''
-    if x > 0.:
-        return cdf(x)
-    else:
-        return 0.
-
-
-def abs_mix_cdf(x, probs, mus=0., sigmas=1., **theta_F):
-    ''' CDF of the absolute value of a mixture distribution '''
-
-    return abs_cdf(x, cdf=lambda x: mix_cdf(x, probs, mus, sigmas, **theta_F))
-
-
-def sq_mix_cdf(x, probs, mus=0., sigmas=1., **theta_F):
-    ''' CDF of the square of a mixture distribution '''
-
-    return sq_cdf(x, cdf=lambda x: mix_cdf(x, probs, mus, sigmas, **theta_F))
-
-
-def pos_mix_cdf(x, probs, mus=0., sigmas=1., **theta_F):
-    ''' CDF of the positive part of a mixture distribution '''
-
-    return pos_cdf(x, cdf=lambda x: mix_cdf(x, probs, mus, sigmas, **theta_F))
-
-
-def inv_cdf(cdf, p, lo, hi):
-    '''
-    numeric approximation of the quantile function of the distribution 'dist'
-
-    if cdf(hi) < p or cdf(lo) > p, simply returns 2·hi resp. 2·lo (assuming
-    that lo < 0)
-
-    Parameters:
-    -----------
-    cdf: cdf to be inverted
-        distribution whose CDF is to be inverted.
-    p: list or array
-        quantile levels.
-
-    '''
-
-    q = np.full(len(p), np.nan)
-    for i in range(len(p)):
-        if cdf(lo) <= p[i] <= cdf(hi):
-            q[i] = brentq(f=lambda x: cdf(x) - p[i], a=lo, b=hi, xtol=1e-6)
-        elif cdf(hi) < p[i]:
-            q[i] = 2.0 * hi
-        elif cdf(lo) > p[i]:
-            q[i] = 2.0 * lo
-
-    return q
-
-
-def cap(values, floor=None, ceil=None):
-    '''
-    takes an array and caps each non-None entry while leaving None entries
-    unchanged
-    '''
-    if isinstance(values, float) or values is None:
-        return np.clip(values, floor, ceil) if values is not None else None
-    else:
-        values[values != None] = np.clip(values[values != None], floor, ceil)
-        return values
-
-# Loss functions for assessment of prediction accuracy
-
-def sq_err(pred, truth):
-    return (pred-truth)**2
-
-
-def perc_err(pred, truth):
-    return abs(pred - truth) / (truth + 1)
-
-
-def mov_avg(x, w):
-    '''
-    moving average of the last 'w' values
-    '''
-    if x.ndim == 1:
-        ret = np.cumsum(x, dtype=float)
-        ret[w:] = ret[w:] - ret[:-w]
-        return ret[w-1:] / w
-    elif x.ndim == 2:
-        ret = np.cumsum(x, axis=1, dtype=float)
-        ret[:, w:] = ret[:, w:] - ret[:, :-w]
-        return ret[:, w-1:] / w
+    # Neural SV
+    elif 'w' in params_names:
+        pass
 
 
 # activation functions (for parameter transforms, reservoir computers, ...)
 
 def Id(x):
-    ''' R --> R '''
+    ''' leaves input unchanged '''
     return x
 
 
 def sigmoid(x):
-    ''' R --> [0, 1] '''
-    x = cap(x, floor=-500)  # avoids overflow (returns 0 anyway)
+    ''' smooth map into [0, 1] '''
+    x = np.clip(x, -500., None)  # avoids overflow (returns 0 anyway)
     return 1/(1 + np.exp(-x))
 
 
 def tanh(x):
-    ''' R --> [-1, 1] '''
+    ''' maps smoothly into [-1, 1] '''
     return np.tanh(x)
 
 
 def relu(x):
-    ''' R --> R_+ '''
-    return np.maximum(0, x)
+    ''' non-smooth map into [0,∞) '''
+    return np.clip(x, 0.0, None)
+
+
+def shi(x):
+    ''' non-smooth map into [-1,1] '''
+    return np.clip(x, -1.0, 1.0)
 
 
 # parameter transforms
@@ -234,7 +111,7 @@ def set_prior(model):
                 prior['beta'] = Beta(1., 1.)
             else:
                 for j in range(q+1):
-                    prior['w' + str(j)] = Normal(loc=0., scale=3.)
+                    prior['w' + str(j)] = Laplace(loc=0., scale=3.)
 
             if model['variant'] in ['gjr', 'thr', 'exp']:
                 prior['gamma'] = Normal(loc=0., scale=10.)
@@ -249,7 +126,7 @@ def set_prior(model):
             prior['d2'] = Gamma(1., 0.5)
 
     else:  # same but for every regime
-        if model['switching'] == 'mixing':
+        if model['switching'] in ['mix', 'mixing']:
             if model['regimes'] == 2:
                 prior['p_0'] = Beta(1., 1.)
             else:
@@ -308,53 +185,35 @@ def set_prior(model):
     return prior
 
 
-# kernel functions (for Guyon & Lekeufack's model)
-
-def tspl(t, tp, alpha, delta):
-    '''
-    "time-shifted power law" kernel used by Guyon & Lekeufack (2023)
-    '''
-    alpha = alpha[:, :, np.newaxis]
-    delta = delta[:, :, np.newaxis]
-
-    tau = abs(t-tp)  # (t,)
-    weights = (tau + delta)**(-alpha)  # (N,K,t)
-
-    # normalize so that axis 2 sums to 1
-    weights = weights / weights.sum(axis=2)[:, :, np.newaxis]
-
-    return weights
-
-
-def out_fct(model):  # to collect only relevant things to save memory
+def out_fct(smc):  # to collect only relevant things to save memory
     '''
     function defining which quantities/variables to collect while running SMC.
 
     Parameters:
     -----------
 
-    model: SMC object
+    smc: SMC object
         model; object which contains variables to be collected as attributes
 
     '''
-    Z = np.array(model.summaries.logLts)
-    theta = model.X.theta  # particles / posterior samples
-    prior = model.fk.model.prior.laws
-    W = model.W  # particle weights
-    ESS = np.array(model.summaries.ESSs)
-    rs_flags = np.array(model.summaries.rs_flags)
-    MH_acc = np.array(model.X.shared['acc_rates']).flatten()  # MH acceptance rates
-    preds = model.fk.model.predictions
-    predsets = model.fk.model.predsets
+    Z = np.array(smc.summaries.logLts)
+    theta = smc.X.theta
+    prior = smc.fk.model.prior.laws
+    W = smc.W
+    ESS = np.array(smc.summaries.ESSs)
+    rs_flags = np.array(smc.summaries.rs_flags)
+    MH_acc = np.array(smc.X.shared['acc_rates']).flatten()
+    preds = smc.preds
+    predsets = smc.predsets
 
     dic = {
-        'Z_t': Z,
+        'Z': Z,
         'theta_T': theta,
         'W_T': W,
         'prior': prior,
-        'ESS_t': ESS,
+        'ESS': ESS,
         'rs_flags': rs_flags,
-        'MH_Acc_t': MH_acc,
+        'MH_Acc': MH_acc,
         'Preds': preds,
         'PredSets': predsets
         }

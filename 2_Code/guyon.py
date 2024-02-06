@@ -1,6 +1,25 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+import numpy as np
+
+
+# kernel functions
+
+def tspl(t, tp, alpha, delta):
+    '''
+    "time-shifted power law" kernel
+    '''
+    alpha = alpha[:, :, np.newaxis]
+    delta = delta[:, :, np.newaxis]
+
+    tau = abs(t-tp)  # (t,)
+    weights = (tau + delta)**(-alpha)  # (N,K,t)
+
+    # normalize so that axis 2 sums to 1
+    weights = weights / weights.sum(axis=2)[:, :, np.newaxis]
+
+    return weights
 
 class Guyon:
     '''
