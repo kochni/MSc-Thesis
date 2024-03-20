@@ -594,7 +594,7 @@ class GenHyp(ProbDist):
                                        self.loc, self.scale)
 
 
-# (!) modification
+# (!) modification (!)
 ################################
 # Truncated Continuous Distr's #
 ################################
@@ -998,21 +998,22 @@ class Mixture(ProbDist):
 
     def rvs(self, size=None):
         k = Categorical(p=self.pk).rvs(size=size)
+        xk = [cd.rvs(size=size) for cd in self.components]
+        # sub-optimal, we sample N x K values
+        return np.choose(k, xk)
 
         # (!) modification (!)
-        # original code:
-        # xk = [cd.rvs(size=size) for cd in self.components]
-        # sub-optimal, we sample N x k values
-        # return np.choose(k, xk)
+        # alternative code (doesn't quite work):
+        # samples = np.full(size, np.nan)
+        # if K < size, quicker to loop through K and v.v.
+        # if self.K < size:
+        #     for j in range(self.K):
+        #         s = self.components[j].rvs(size=sum(k==j))
+        #         samples[k==j] = self.components[j].rvs(size=sum(k==j))
+        # else:
+        #     for i in range(size):
+        #         samples[i] = self.components[k[i]].rvs(size=1)
 
-        # new code:
-        samples = np.full(size, np.nan)
-        if self.K < size:
-            for j in range(self.K):
-                samples[k==j] = self.components[j].rvs(sum(k==j))
-        else:
-            for i in range(size):
-                samples[i] = self.components[k[i]].rvs(size=1)
         return samples
 
 
@@ -1053,40 +1054,40 @@ class MixMissing(ProbDist):
 
 
 from numpy import random
-import tensorflow as tf  # only package that supports vectorization
-from tensorflow_probability import distributions as tf_dist
+# import tensorflow as tf  # only package that supports vectorization
+# from tensorflow_probability import distributions as tf_dist
 
 
-class Dirichlet(ProbDist):  # ! caution: self-defined !
-    '''
-    Dirichlet distribution on the probability simplex
-
-    '''
-
-    def __init__(self, alpha):
-        self.alpha = alpha
-        self.dist = tf_dist.Dirichlet(concentration=alpha,
-                                      force_probs_to_zero_outside_support=True)
-
-    @property
-    def dim(self):
-        return self.alpha.shape[0] - 1
-
-    def rvs(self, size=None):
-        sample = self.dist.sample(size)
-        sample = sample.numpy()
-        return sample[:, :-1]
-
-    def logpdf(self, x):
-        x = np.hstack([x, 1 - x.sum(axis=1).reshape(-1, 1)])
-        x = tf.convert_to_tensor(x, dtype=tf.float64)
-        log_lik = self.dist.log_prob(x)
-        log_lik = log_lik.numpy()
-        # print("log-lik:", log_lik)
-        return log_lik
-
-    def ppf(self, u):
-        pass
+# class Dirichlet(ProbDist):  # ! caution: self-defined !
+#     '''
+#     Dirichlet distribution on the probability simplex
+#
+#     '''
+#
+#     def __init__(self, alpha):
+#         self.alpha = alpha
+#         self.dist = tf_dist.Dirichlet(concentration=alpha,
+#                                       force_probs_to_zero_outside_support=True)
+#
+#     @property
+#     def dim(self):
+#         return self.alpha.shape[0] - 1
+#
+#     def rvs(self, size=None):
+#         sample = self.dist.sample(size)
+#         sample = sample.numpy()
+#         return sample[:, :-1]
+#
+#     def logpdf(self, x):
+#         x = np.hstack([x, 1 - x.sum(axis=1).reshape(-1, 1)])
+#         x = tf.convert_to_tensor(x, dtype=tf.float64)
+#         log_lik = self.dist.log_prob(x)
+#         log_lik = log_lik.numpy()
+#         # print("log-lik:", log_lik)
+#         return log_lik
+#
+#     def ppf(self, u):
+#         pass
 
 
 class MvNormal(ProbDist):
@@ -1426,8 +1427,9 @@ class StructDist(ProbDist):
 # Other
 #########
 
-def F_innov(mean=0., sd=1., a=None, b=None,
-            df=None, tail=None, shape=None, skew=None):
+def F_innov(mean=0., sd=1.,
+            df=None, tail=None, shape=None, skew=None,
+            a=None, b=None,):
     '''
     Wrapper function for innovation distributions.
 
@@ -1447,31 +1449,34 @@ def F_innov(mean=0., sd=1., a=None, b=None,
         any distribution parameters
 
     '''
+    # Gaussian
     if df is None and tail is None:
-        if a is None and b is None:
-            return Normal(mean, sd)
-        else:
-            return TruncNormal(mean, sd, a, b)
+        # if (a is None and b is None):
+        return Normal(mean, sd)
+        # else:
+        #     return TruncNormal(mean, sd, a, b)
 
+    # Student t
     elif df is not None:
-        m, v = stats.t.stats(df=df)
+        _, v = stats.t.stats(df=df)
         base_distr = Student(df, mean, sd/np.sqrt(v))
-        if a is None and b is None:
+        if (a is None and b is None):
             return base_distr
         else:
             return TruncDist(base_distr, a=a, b=b)
 
+    # Gen. Hyperbolic
     else:
         m, v = stats.genhyperbolic.stats(p=tail, a=shape, b=skew)
         base_distr = GenHyp(loc=-m/np.sqrt(v), scale=sd/np.sqrt(v), tail=tail,
                       shape=shape, skew=skew)
-        if a is None and b is None:
+        if (a is None and b is None):
             return base_distr
         else:
             return TruncDist(base_distr, a=a, b=b)
 
 
-def mix_cdf(x, probs, mus=0., sigmas=1., **theta_F):
+def mix_cdf(x, probs, mus=0., sigmas=1., a=None, b=None, **theta_F):
     '''
     CDF of a mixture of the innovation distribution
 
@@ -1491,7 +1496,7 @@ def mix_cdf(x, probs, mus=0., sigmas=1., **theta_F):
     '''
 
     # CDF of mixture distribution is weighted sum of individual CDFs
-    return np.einsum('N,N->...', probs, F_innov(mus, sigmas, **theta_F).cdf(x))
+    return np.sum(probs * F_innov(mus, sigmas, **theta_F, a=a, b=b).cdf(x))
 
 
 def abs_cdf(x, cdf):
@@ -1521,22 +1526,22 @@ def pos_cdf(x, cdf):
         return 0.
 
 
-def abs_mix_cdf(x, probs, mus=0., sigmas=1., **theta_F):
+def abs_mix_cdf(x, probs, mus=0., sigmas=1., a=None, b=None, **theta_F):
     ''' CDF of the absolute value of a mixture distribution '''
 
-    return abs_cdf(x, cdf=lambda x: mix_cdf(x, probs, mus, sigmas, **theta_F))
+    return abs_cdf(x, cdf=lambda x: mix_cdf(x, probs, mus, sigmas, **theta_F, a=a, b=b))
 
 
-def sq_mix_cdf(x, probs, mus=0., sigmas=1., **theta_F):
+def sq_mix_cdf(x, probs, mus=0., sigmas=1., a=None, b=None, **theta_F):
     ''' CDF of the square of a mixture distribution '''
 
-    return sq_cdf(x, cdf=lambda x: mix_cdf(x, probs, mus, sigmas, **theta_F))
+    return sq_cdf(x, cdf=lambda x: mix_cdf(x, probs, mus, sigmas, **theta_F, a=a, b=b))
 
 
-def pos_mix_cdf(x, probs, mus=0., sigmas=1., **theta_F):
+def pos_mix_cdf(x, probs, mus=0., sigmas=1., a=None, b=None, **theta_F):
     ''' CDF of the positive part of a mixture distribution '''
 
-    return pos_cdf(x, cdf=lambda x: mix_cdf(x, probs, mus, sigmas, **theta_F))
+    return pos_cdf(x, cdf=lambda x: mix_cdf(x, probs, mus, sigmas, **theta_F, a=a, b=b))
 
 
 def inv_cdf(cdf, p, lo, hi):

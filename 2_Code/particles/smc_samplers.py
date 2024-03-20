@@ -619,7 +619,11 @@ class ArrayRandomWalk(ArrayMetropolis):
         N, d = arr.shape
         m, cov = rs.wmean_and_cov(W, arr)
         scale = 2.38 / np.sqrt(d)
-        x.shared["chol_cov"] = scale * linalg.cholesky(cov, lower=True)
+        try:
+            x.shared["chol_cov"] = scale * linalg.cholesky(cov, lower=True)
+        except:
+            cov = np.diag(np.diag(cov))
+            x.shared["chol_cov"] = scale * linalg.cholesky(cov, lower=True)
 
     def proposal(self, x, xprop):
         L = x.shared["chol_cov"]
@@ -770,6 +774,7 @@ class FKSMCsampler(particles.core.FeynmanKac):
 
 
 class IBIS(FKSMCsampler):
+
     def logG(self, t, xp, x):
         lpyt = self.model.logpyt(x.theta, t)
         x.lpost += lpyt
@@ -1082,7 +1087,7 @@ class SMC2(FKSMCsampler):
 
         # (!) modification (!)
         self.S = data  # raw prices
-        self.data = 100 * np.log(data[1:]/data[:-1])  # returns
+        self.data = 100.0 * np.log(data[1:]/data[:-1])  # returns
 
     @property
     def T(self):
@@ -1112,7 +1117,7 @@ class SMC2(FKSMCsampler):
             return lpyt
 
     def alg_instance(self, theta, N):
-        return particles.SMC(
+        return particles.core.SMC(
             fk=self.fk_cls(ssm=self.ssm_cls(**theta), data=self.data),
             N=N,
             **self.smc_options
@@ -1149,6 +1154,10 @@ class SMC2(FKSMCsampler):
             return xp
 
     def exchange_step(self, x, t, new_Nx):
+        # (!) modification (!)
+        # cap Nx at 1'000
+        new_Nx = np.clip(new_Nx, None, 1000)
+
         old_lpost = x.lpost.copy()
         # exchange step occurs at beginning of step t, so y_t not processed yet
         self.current_target(t - 1, new_Nx)(x)

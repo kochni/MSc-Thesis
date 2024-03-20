@@ -111,6 +111,7 @@ err_msg_missing_trans = """
     of Markov transition X_t | X_{t-1}. This is required by most smoothing
     algorithms."""
 
+
 class FeynmanKac:
     """Abstract base class for Feynman-Kac models.
 
@@ -272,11 +273,14 @@ class SMC:
         verbose=False,
         collect=None,
 
-        # for prediction (!) modification (!)
+        # (!) modification (!)
+        # variables for prediction
         h=None,
         M=None,
-        uq_method=None,
+        naive_uq=None,
+        cal_uq=None,
         alpha=None,
+        eta=None,
         strike=None
     ):
 
@@ -291,18 +295,25 @@ class SMC:
         self.t = 0
         self.rs_flag = False  # no resampling at time 0, by construction
         self.logLt = 0.0
+        self.DIC = 0.0  # (!) modification (!)
         self.wgts = rs.Weights()
         self.aux = None
         self.X, self.Xp, self.A = None, None, None
 
-        # predictions (!) modification (!)
+        # (!) modification (!)
         self.preds = {}
         self.predsets = {}
-        self.h = h,
-        self.M = M,
-        self.uq_method = uq_method,
-        self.alpha = alpha,
+        self.h = h
+        self.M = M
+        self.naive_uq = naive_uq
+        self.cal_uq = cal_uq
+        self.alpha = alpha
+        self.alpha_star_RV = alpha
+        self.alpha_star_S = alpha
+        self.alpha_star_C = alpha
+        self.eta = eta
         self.strike = strike
+        self.rand_proj = {}
 
         # summaries computed at every t
         if collect == "off":
@@ -376,10 +387,10 @@ class SMC:
         theta = self.X.theta  # (N,n_params), structured array
         N = len(theta)
 
-        # Model Parameters
+        # (1) Model Parameters
         # GARCH:
         if 'alpha' in theta.dtype.names and 'beta' in theta.dtype.names:
-            theta['omega'] = np.clip(theta['omega'], 0., None)
+            theta['omega'] = np.clip(theta['omega'], 0., 100.)
             theta['alpha'] = np.clip(theta['alpha'], 0., 1.)
             theta['beta'] = np.clip(theta['beta'], 0., 1.)
         elif 'alpha_0' in theta.dtype.names and 'beta_0' in theta.dtype.names:
@@ -414,71 +425,93 @@ class SMC:
             theta['xi_1'] = np.clip(theta['xi_1'], 0., None)
         # Neural:
 
-        # parameters of return distribution
+        # (2) Distribution parameters
+        # Return distribution:
         if 'df_X' in theta.dtype.names:
-            theta['df_X'] = np.clip(theta['df_X'], 2.+1e-10, None)
+            theta['df_X'] = np.clip(theta['df_X'], 3.0, 500.)
         elif 'tail_X' in theta.dtype.names:
             theta['tail_X'] = np.clip(theta['tail_X'], -50., 50.)
             skew_X = np.clip(theta['skew_X'], -50., 50.)
             theta['skew_X'] = skew_X
             theta['shape_X'] = np.clip(theta['shape_X'],
-                                     abs(skew_X)+1e-3, 50.+1e-3)
+                                     abs(skew_X)+0.01, 50.01)
 
-        # parameters of innovation distribution
+        # Volatility distribution
         if 'df_V' in theta.dtype.names:
-            theta['df_V'] = np.clip(theta['df_V'], 2.+1e-10, None)
+            theta['df_V'] = np.clip(theta['df_V'], 3.0, 500.)
         elif 'tail_V' in theta.dtype.names:
             theta['tail_V'] = np.clip(theta['tail_V'], -50., 50.)
             skew_V = np.clip(theta['skew_V'], -50., 50.)
-            theta['skew_V'] = skew_X
+            theta['skew_V'] = skew_V
             theta['shape_V'] = np.clip(theta['shape_V'],
-                                       abs(skew_X) + 1e-3, 50. + 1e-3)
+                                       abs(skew_V)+0.01, 50.01)
+
+        # (3) Jump parameters
+        # Jumps in returns:
+        if 'lambda_X' in theta.dtype.names:
+            theta['lambda_X'] = np.clip(theta['lambda_X'], 0., 1.)
+            theta['phi_X'] = np.clip(theta['phi_X'], 0., 1e10)
+        # Jumps in volatility
+        if 'jumps_V' in theta.dtype.names:
+            theta['lambda_V'] = np.clip(theta['lambda_V'], 0., 1.)
+            theta['phi_V'] = np.clip(theta['phi_V'], 0., 50.)
 
         return theta
 
     def probs(self, theta, K):
+        ''' probabilities of regimes and jumps for SMC^2 models '''
 
         N = len(theta)
 
-        # regime probabilities
+        # regime probabilities (N,K)
         if K == 1:
-            p_regimes = np.ones([N, 1])
+            p_regimes = np.ones([N, 1])  # (N,1)
         elif K == 2:
             p_0 = theta['p_0']
-            p_regimes = np.stack([p_0, 1.0-p_0], axis=1)
+            p_regimes = np.vstack([p_0, 1.0-p_0]).T  # (N,2)
         elif K == 3:
             p_0 = theta['p_0']
             p_1 = theta['p_1']
-            p_regimes = np.stack([p_0, p_1, 1.0-p_0-p_1], axis=2)
+            p_regimes = np.vstack([p_0, p_1, 1.0-p_0-p_1]).T
 
-        # jump probabilities
+        # jump probabilities (N,J) where J=1 if no jumps and J=2 if yes
         if 'lambda_X' not in theta.dtype.names:
             p_jumps_X = np.ones([N, 1])
         else:
-            lambda_X = np.clip(theta['lambda_X'], 0., 1.)
-            p_jumps_X = np.stack([1.0-lambda_X, lambda_X])
+            lambda_X = theta['lambda_X']
+            p_jumps_X = np.vstack([1.0-lambda_X, lambda_X]).T
 
         if 'lambda_V' not in theta.dtype.names:
             p_jumps_V = np.ones([N, 1])
         else:
-            lambda_V = np.clip(theta['lambda_V'], 0., 1.)
-            p_jumps_V = np.stack([1.0-lambda_V, lambda_V])
+            lambda_V = theta['lambda_V']
+            p_jumps_V = np.vstack([1.0-lambda_V, lambda_V]).T
 
         return p_regimes, p_jumps_X, p_jumps_V
 
     def predict_IBIS(self):
+        '''
+        produce point predictions and prediction sets for IBIS models
+
+        Note: first datapoint is actually X_1 = log(S_1/S_0); last datapoint
+              is log(S_T/S_{T-1}), where T is length of price series.
+              Hence, quantities being predicted are
+              - X_{t+1} = 100·log(S_t/S_{t-1}) = X[t]
+              - S_{t+1} = S_t·exp(X_t/100)
+              - C_{t+1} = (S_{t+1} - S_t)_+
+
+        '''
 
         t = self.t  # current time step
-        M = self.M[0]  # no. of returns sampled; (!) why tuple??
+        returns = self.fk.model.data
+        S = self.fk.model.S  # prices
+        S_t = S[t]
+        M = self.M  # no. of returns sampled;
 
-        Nx = 1
         K = self.fk.model.K
-        innov_X = self.fk.model.innov_X
-        S = self.fk.model.S
-        returns = 0.  # (!)
 
-        # theta-particles & weights
-        N = self.N  # no. of particles
+        # θ-particles & weights
+        N = self.N  # no. of θ-particles
         W = self.W  # weights
         theta = self.theta_capped(K)  # capped particles
 
@@ -492,19 +525,19 @@ class SMC:
         # parameters of innov distr
         theta_FX = {}
         if innov_X == 't':
-            theta_FX['df'] = theta['df_X']
+            theta_FX['df'] = theta['df_X'].reshape(N, 1, 1)
         elif innov_X == 'GH':
-            theta_FX['shape'] = theta['shape_X']
-            theta_FX['tail'] = theta['tail_X']
-            theta_FX['skew'] = theta['skew_X']
+            theta_FX['shape'] = theta['shape_X'].reshape(N, 1, 1)
+            theta_FX['tail'] = theta['tail_X'].reshape(N, 1, 1)
+            theta_FX['skew'] = theta['skew_X'].reshape(N, 1, 1)
 
         # jumps
-        jumps_X = True if 'lambda_X' in theta.dtype.names else False
+        jumps_X = self.fk.model.jumps_X
 
         ####################
         # Simulate Returns #
         ####################
-        M = self.M[0]  # no. of simulations; (!) why tuple??
+        M = self.M  # no. of simulations; (!) why tuple??
 
         # gather all possible combinations of indices of stochastic components
         i_set = np.arange(0, N, 1)    # θ-particle indices
@@ -525,11 +558,12 @@ class SMC:
         k_ind = I[ind_set_ind, 1]  # ...
         JX_ind = I[ind_set_ind, 2]
 
+        # sampled volatilities
         vol_sim = vols[i_ind, k_ind, JX_ind]  # (M,)
 
         # sample 1 return for each sampled volatility
-        theta_FX_smpl = {k: v[i_ind] for k, v in theta_FX.items()}
-        X_sim = F_innov(0., vol_sim, **theta_FX_smpl).rvs(M)
+        theta_FX_smpl = {k: v[i_ind, k_ind, 0] for k, v in theta_FX.items()}  # (M,)
+        X_sim = F_innov(0., vol_sim, **theta_FX_smpl).rvs(M)  # (M,)
         X_sim = np.clip(X_sim, -50., 50.)
 
         #####################
@@ -542,55 +576,63 @@ class SMC:
         # no point prediction (assumed martingale)
 
         # (3) Option Payout
-        strike = S[t] if self.strike == 'last' else self.strike
-        C_sim = np.maximum(np.exp(0.01*X_sim) * S[t] - strike, 0.)
+        strike = S_t if self.strike == 'last' else self.strike
+        C_sim = np.clip(np.exp(0.01*X_sim) * S_t - strike, 0., None)
         C_pred = np.mean(C_sim)
 
         ###################
         # Prediction Sets #
         ###################
-        alpha = self.alpha[0]  # miscoverage tolerance (!) why tuple ??
-        q_central = [0.5*alpha, 1.0-0.5*alpha]  # for central intervals
-        q_upper = [1.0-alpha]  # for upper bound / VaR intervals
+
+        # naive quantile levels:
+        q_S = [0.5*self.alpha, 1.-0.5*self.alpha]
+        q_RV = [1.-self.alpha]
+        q_C = [1.-self.alpha]  # for upper bound / VaR intervals
+
+        # calibrated quantile levels:
+        if self.cal_uq is True:
+            q_S += [0.5*self.alpha_star_S, 1.-0.5*self.alpha_star_S]
+            q_RV += [1.-self.alpha_star_RV]
+            q_C += [1.-self.alpha_star_C]
 
         # for non-GH innovations, get "closed form" (i.e., quantiles of
         # induced mixture distribution) for variance reduction
-        vols = vols.flatten()
-        probs = probs.flatten()
         if innov_X != 'GH':
             # (1) Realized Variance
             RV_predset = inv_cdf(cdf=lambda x: sq_mix_cdf(x, probs, 0., vols,
                                                           **theta_FX),
-                                 p=q_central, lo=0., hi=100.)
+                                 p=q_RV, lo=0., hi=100.)
+            RV_predset = [0.0, RV_predset[0], 0.0, RV_predset[1]]
 
             # (2) Price
             X_predset = inv_cdf(cdf=lambda x: mix_cdf(x, probs, 0., vols,
                                                       **theta_FX),
-                                p=q_central, lo=-50., hi=50.)
-            S_predset = np.exp(0.01*X_predset) * S[t]
+                                p=q_S, lo=-50., hi=50.)
+            S_predset = np.exp(0.01*X_predset) * S_t
 
             # (3) Option Payout
             X_predset = inv_cdf(cdf=lambda x: mix_cdf(x, probs, 0., vols,
                                                       **theta_FX),
-                                p=q_upper, lo=0., hi=50.)
-            C_predset = np.exp(0.01*X_predset) * S[t] - strike
-            C_predset = np.concatenate([np.array([0.]), C_predset])
+                                p=q_C, lo=0., hi=50.)
+            C_predset = np.exp(0.01*X_predset) * S_t - strike
+            C_predset = [0.0, C_predset[0], 0.0, C_predset[1]]
 
         # GH CDF too intensive to evaluate, inversion not feasible
         # -> use empirical quantiles from simulated returns
         else:
             # (1) Realized Variance
-            RV_predset = np.quantile(X_sim**2, q_central)
+            RV_predset = np.quantile(X_sim**2, q_RV)
+            RV_predset = [0.0, RV_predset[0], 0.0, RV_predset[1]]
 
             # (2) Price
-            X_predset = np.quantile(X_sim, q_central)
-            S_predset = np.exp(0.01*X_predset) * S[t]
+            X_predset = np.quantile(X_sim, q_S)
+            S_predset = np.exp(0.01*X_predset) * S_t
 
             # (3) Option Payouts
-            C_predset = np.quantile(C_sim, q_upper)
-            C_predset = np.concatenate([np.array([0.]), C_predset])
+            C_predset = np.quantile(C_sim, q_C)
+            C_predset = [0.0, C_predset[0], 0.0, C_predset[1]]
 
-        # append attributes with pred's & pred' sets
+        # append pred's & pred' sets
         if t == 0:
             self.preds['RV'] = RV_pred
             self.preds['C'] = C_pred
@@ -607,17 +649,41 @@ class SMC:
             self.predsets['S'] = np.vstack([self.predsets['S'], S_predset])
             self.predsets['C'] = np.vstack([self.predsets['C'], C_predset])
 
+        # check coverage & calibrate quantile level:
+        S_next = S[t+1]
+        RV_next = returns[t]**2
+        C_next = np.clip(S_next - S_t, 0.0, None)  # option payouts
+
+        RV_err = 1.0 - (RV_predset[2] <= RV_next <= RV_predset[3])
+        S_err = 1.0 - (S_predset[2] <= S_next <= S_predset[3])
+        C_err = 1.0 - (C_predset[2] <= C_next <= C_predset[3])
+
+        self.alpha_star_RV += self.eta * (self.alpha - RV_err)
+        self.alpha_star_S += self.eta * (self.alpha - S_err)
+        self.alpha_star_C += self.eta * (self.alpha - C_err)
+
+        self.alpha_star_RV = np.clip(self.alpha_star_RV, 0.001, 0.999)
+        self.alpha_star_S = np.clip(self.alpha_star_S, 0.001, 0.999)
+        self.alpha_star_C = np.clip(self.alpha_star_C, 0.001, 0.999)
+
     def predict_SMC2(self):
         '''
-        produce point predictions & prediction sets for SMC2 models
+        produce point predictions and prediction sets for SMC^2 models
+
+        Note: first datapoint is actually X_1 = log(S_1/S_0).
+              Hence X_t = X[t-1], and  quantities being predicted are
+              - X_{t+1} = 100·log(S_t/S_{t-1}) = X[t]
+              - S_{t+1} = S_t·exp(X_t/100)
+              - C_{t+1} = (S_{t+1} - S_t)_+
 
         '''
-
         # prepare commonly used variables
         t = self.t  # current time step
         K = self.X.pfs[0].fk.ssm.K
         S = self.fk.S
+        S_t = S[t]
         returns = self.fk.data
+        T = len(S)
 
         # θ-particles & weights
         theta = self.theta_capped(K)  # particles
@@ -625,21 +691,23 @@ class SMC:
         W = self.W  # weights
 
         # x-particles & weights
-        Nx = self.X.pfs[0].N  # no. of particles
-        x = np.full([N, Nx], np.nan)   # particles
+        Nx = self.X.pfs[0].N  # no. of x-particles
+        x = np.full([N, Nx], np.nan)   # x-particles
         Wx = np.full([N, Nx], np.nan)  # weights
         for i in range(N):
             x[i, :] = self.X.pfs[i].X
             Wx[i, :] = self.X.pfs[i].W
         x = np.clip(x, -50., 50.)
 
-        # reservoirs (for ESN)
-        q = self.X.pfs[0].fk.ssm.q  # reservoir dimensionality
-        res1 = np.full([q, N, Nx], np.nan)  # drift-of-vol reservoirs
-        res2 = np.full([q, N, Nx], np.nan)  # vol-of-vol reservoirs
-        for i in range(N):
-            res1[:, i, :] = self.X.pfs[i].fk.ssm.res1
-            res2[:, i, :] = self.X.pfs[i].fk.ssm.res2
+        # reservoirs (for ResComps)
+        rc_names = ['Extreme', 'Echo', 'Barron', 'Sig', 'RandSig']
+        if any(s in str(self.X.pfs[0].fk.ssm) for s in rc_names):
+            q = self.X.pfs[0].fk.ssm.q  # reservoir dimensionality
+            res = np.full([q, N, Nx], np.nan)  # reservoirs
+            for i in range(N):
+                res[:, i, :] = self.X.pfs[i].fk.ssm.res
+        else:
+            res = np.full([1, N, Nx], np.nan)  # reservoirs
 
         # innovations
         innov_X = self.X.pfs[0].fk.ssm.innov_X
@@ -649,17 +717,17 @@ class SMC:
         p_regimes, p_jumps_X, p_jumps_V = self.probs(theta, K)
 
         # whether jumps specified or not
-        jumps_X = True if 'lambda_X' in theta.dtype.names else False
-        jumps_V = True if 'lambda_V' in theta.dtype.names else False
+        jumps_X = self.X.pfs[0].fk.ssm.jumps_X
+        jumps_V = self.X.pfs[0].fk.ssm.jumps_V
 
         ####################
         # Simulate Returns #
         ####################
-        M = self.M[0]  # no. of simulations; (!) why tuple??
+        M = self.M  # no. of simulations; (!) why tuple??
 
         # gather all possible combinations of indices of stochastic components
         i_set = np.arange(0, N, 1)   # θ-particle indices
-        j_set = np.arange(0, Nx, 1)  # x-particle indices
+        j_set = np.arange(0, Nx, 1)  # V-particle indices
         k_set = np.arange(0, K, 1)   # regime indices
         JX_set = np.arange(0, jumps_X+1, 1)  # X-jump indicators
         JV_set = np.arange(0, jumps_V+1, 1)  # V-jump indicators
@@ -669,8 +737,7 @@ class SMC:
         # probability of each combination
         probs = np.einsum('N,NS,NK,NJ,NL->NSKJL', W, Wx, p_regimes,
                           p_jumps_X, p_jumps_V)
-
-        # (!) are probabilities in correct order?
+        # (!) are probabilities in correct order? (!)
 
         # sample indices
         n_distinct = len(I)  # no. of different index combinations
@@ -684,17 +751,24 @@ class SMC:
         JX_ind = I[ind_set_ind, 3]
         JV_ind = I[ind_set_ind, 4]
 
-        # sample M volatilities
+        # (1) sample M volatilities:
+        # E[log(V_{t+1}^2)]
         ElogV2 = self.X.pfs[0].fk.ssm.EXt(theta[i_ind],
                                           x[i_ind, j_ind],
                                           returns[t-1],
-                                          res1[:, i_ind, j_ind],
-                                          k_ind)
+                                          k_ind,
+                                          res[:, i_ind, j_ind])
+
+        # SD(log(V_{t+1}^2)) (w/o jump!)
         SDlogV2 = self.X.pfs[0].fk.ssm.SDXt(theta[i_ind],
                                             x[i_ind, j_ind],
                                             returns[t-1],
-                                            res2[:, i_ind, j_ind],
-                                            k_ind)
+                                            k_ind,
+                                            res[:, i_ind, j_ind])
+
+        if jumps_V is True:
+            # increase vol-olf-vol where V-jump occured:
+            SDlogV2[JV_ind==1] = np.sqrt(SDlogV2[JV_ind==1]**2 + theta['phi_V'][i_ind[JV_ind==1]]**2)
 
         theta_FV = {}
         if innov_V == 't':
@@ -704,10 +778,16 @@ class SMC:
             theta_FV['tail'] = theta['tail_V'][i_ind]
             theta_FV['skew'] = theta['skew_V'][i_ind]
 
-        logV2_sim = F_innov(ElogV2, SDlogV2, **theta_FV, a=-10., b=10.).rvs(M)
+        logV2_sim = F_innov(ElogV2, SDlogV2, **theta_FV, a=-20., b=20.).rvs(M)
+        logV2_sim = np.clip(logV2_sim, -20., 20.)  # truncation not applied if Gaussian
+        V2_sim = np.exp(logV2_sim)
         vol_sim = np.exp(0.5*logV2_sim)
 
-        # sample 1 return for each sampled volatility
+        # (2) sample 1 return for each sampled volatility
+        if jumps_X is True:
+            # increase volatility where X-jump occured:
+            vol_sim[JX_ind==1] = np.sqrt(vol_sim[JX_ind==1] + theta['phi_X'][i_ind[JX_ind==1]]**2)
+
         theta_FX = {}
         if innov_X == 't':
             theta_FX['df'] = theta['df_X'][i_ind]
@@ -722,38 +802,46 @@ class SMC:
         #####################
         # Point Predictions #
         #####################
-        # (1) Realized Variance (!) do variance reduction
-        RV_sim = X_sim ** 2  # sampled realized variances
-        RV_pred = np.mean(RV_sim)
+        # (1) Realized Variance
+        RV_pred = np.mean(V2_sim)
 
         # (2) Price
         # no point prediction (assumed martingale)
 
         # (3)) Option Payout
-        strike = S[t] if self.strike == 'last' else self.strike
-        C_sim = np.maximum(np.exp(0.01*X_sim) * S[t] - strike, 0.)
+        strike = S_t if self.strike == 'last' else self.strike
+        C_sim = np.clip(np.exp(0.01*X_sim) * S_t - strike, 0., None)
         C_pred = np.mean(C_sim)
 
         ###################
         # Prediction Sets #
         ###################
 
-        alpha = self.alpha[0]  # miscoverage tolerance (!) why tuple ??
-        q_central = [0.5*alpha, 1.0-0.5*alpha]  # for central intervals
-        q_upper = [1.0-alpha]  # for upper bound / VaR intervals
+        # naive quantile levels:
+        q_S = [0.5*self.alpha, 1.-0.5*self.alpha]
+        q_RV = [1.-self.alpha]
+        q_C = [1.-self.alpha]  # for upper bound / VaR intervals
+
+        # calibrated quantile levels:
+        if self.cal_uq is True:
+            q_S += [0.5*self.alpha_star_S, 1.-0.5*self.alpha_star_S]
+            q_RV += [1.-self.alpha_star_RV]
+            q_C += [1.-self.alpha_star_C]
 
         # (1) Realized Variance
-        RV_predset = np.quantile(RV_sim, q_central)
+        RV_sim = X_sim ** 2
+        RV_predset = np.quantile(RV_sim, q_RV)
+        RV_predset = [0.0, RV_predset[0], 0.0, RV_predset[1]]
 
         # (2) Price
-        X_predset = np.quantile(X_sim, q_central)
-        S_predset = np.exp(0.01*X_predset) * S[t]
+        X_predset = np.quantile(X_sim, q_S)
+        S_predset = np.exp(0.01*X_predset) * S_t
 
         # (3) Option Payout
-        C_predset = np.quantile(C_sim, q_upper)
-        C_predset = np.concatenate([np.array([0.]), C_predset])
+        C_predset = np.quantile(C_sim, q_C)
+        C_predset = [0.0, C_predset[0], 0.0, C_predset[1]]
 
-        # append attributes with pred's & pred' sets
+        # append pred's & pred' sets
         if t == 0:
             self.preds['RV'] = RV_pred
             self.preds['C'] = C_pred
@@ -770,15 +858,37 @@ class SMC:
             self.predsets['S'] = np.vstack([self.predsets['S'], S_predset])
             self.predsets['C'] = np.vstack([self.predsets['C'], C_predset])
 
+        # check coverage & calibrate quantile level:
+        S_next = S[t+1]
+        RV_next = returns[t]**2
+        C_next = np.clip(S_next - S_t, 0.0, None)  # option payouts
+
+        RV_err = 1.0 - (RV_predset[2] <= RV_next <= RV_predset[3])
+        S_err = 1.0 - (S_predset[2] <= S_next <= S_predset[3])
+        C_err = 1.0 - (C_predset[2] <= C_next <= C_predset[3])
+
+        self.alpha_star_RV += self.eta * (self.alpha - RV_err)
+        self.alpha_star_S += self.eta * (self.alpha - S_err)
+        self.alpha_star_C += self.eta * (self.alpha - C_err)
+
+        self.alpha_star_RV = np.clip(self.alpha_star_RV, 0.001, 0.999)
+        self.alpha_star_S = np.clip(self.alpha_star_S, 0.001, 0.999)
+        self.alpha_star_C = np.clip(self.alpha_star_C, 0.001, 0.999)
+
+
     def compute_summaries(self):
         if self.t > 0:
             prec_log_mean_w = self.log_mean_w
-        self.log_mean_w = self.wgts.log_mean
+        self.log_mean_w = self.wgts.log_mean  # log mean unnormalized weight
         if self.t == 0 or self.rs_flag:
             self.loglt = self.log_mean_w
         else:
             self.loglt = self.log_mean_w - prec_log_mean_w
         self.logLt += self.loglt
+
+        # (!) modification (!)
+        # self.DIC
+
         if self.verbose:
             print(self)
         if self.hist:
@@ -789,11 +899,41 @@ class SMC:
             self.summaries.collect(self)
 
     def __next__(self):
-        """One step of a particle filter."""
+        """ One step of a particle filter. """
         if self.fk.done(self):
+            # (!) modification (!)
+            # print that model done
+            if 'IBIS' in str(self.fk):
+                model = str(self.fk.model.dynamics) + " (" + str(self.fk.model.variant) + ")"
+                print(model + " done!")
+            elif 'SMC2' in str(self.fk):
+                model = str(self.fk.ssm_cls.__name__)
+                print(model + " done!")
+
             raise StopIteration
+
         if self.t == 0:
+            # (!) modification (!)
+            # in ResComp models, draw new set of random matrices
+            if 'SMC2' in str(self.fk):
+                rc_names = ['Extreme', 'Echo', 'Barron', 'Sig', 'RandSig']
+                if any(s in str(self.fk.ssm_cls) for s in rc_names):
+                    self.fk.ssm_cls.generate_matrices()
+                    if 'Extreme' in str(self.fk.ssm_cls):
+                        self.rand_proj['A'] = self.fk.ssm_cls.A
+                        self.rand_proj['b'] = self.fk.ssm_cls.b
+                        # self.rand_proj['activ'] = shi
+
+            elif 'IBIS' in str(self.fk):
+                self.fk.model.generate_matrices()
+                # if ELM, save inner weights to later check learned function:
+                if self.fk.model.variant == 'elm':
+                    self.rand_proj['A'] = self.fk.model.model.A
+                    self.rand_proj['b'] = self.fk.model.model.b
+                    self.rand_proj['activ'] = self.fk.model.model.activ
+
             self.generate_particles()
+
         else:
             self.setup_auxiliary_weights()  # APF
             if self.qmc:
@@ -809,8 +949,7 @@ class SMC:
         if 'IBIS' in str(self.fk):
             self.predict_IBIS()
         elif 'ThetaParticles' in str(self.X):
-            print("t =", self.t)
-            # self.predict_SMC2()
+            self.predict_SMC2()
 
         self.compute_summaries()
         self.t += 1

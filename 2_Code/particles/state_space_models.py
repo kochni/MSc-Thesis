@@ -229,7 +229,7 @@ class StateSpaceModel:
             shape.append(dim)
         return np.empty(shape, dtype=law_X0.dtype)
 
-    def PX0(self):
+    def PX0(self, Y0):
         "Law of X_0 at time 0"
         raise NotImplementedError(self._error_msg("PX0"))
 
@@ -290,7 +290,7 @@ class StateSpaceModel:
         """
         x = []
         for t in range(T):
-            law_x = self.PX0() if t == 0 else self.PX(t, x[-1], self.data)
+            law_x = self.PX0(self.data[0]) if t == 0 else self.PX(t, x[-1], self.data[0:t])
             x.append(law_x.rvs(size=1))
         y = self.simulate_given_x(x)
         return x, y
@@ -314,33 +314,35 @@ class Bootstrap(particles.core.FeynmanKac):
         considered state-space model
     """
 
+    # (!) arguments of methods modified (!)
+
     def __init__(self, ssm=None, data=None):
         self.ssm = ssm
         self.data = data
-        self.du = self.ssm.PX0().dim
+        self.du = self.ssm.PX0(self.data[0]).dim
 
     @property
     def T(self):
         return 0 if self.data is None else len(self.data)
 
     def M0(self, N):
-        return self.ssm.PX0().rvs(size=N)
+        return self.ssm.PX0(self.data[0]).rvs(size=N)
 
     def M(self, t, xp):
-        return self.ssm.PX(t, xp, self.data).rvs(size=xp.shape[0])
+        return self.ssm.PX(t, xp, self.data[0:t]).rvs(size=xp.shape[0])
 
     def logG(self, t, xp, x):
         return self.ssm.PY(t, x).logpdf(self.data[t])
 
     def Gamma0(self, u):
-        return self.ssm.PX0().ppf(u)
+        return self.ssm.PX0(self.data[0]).ppf(u)
 
     def Gamma(self, t, xp, u):
-        return self.ssm.PX(t, xp, self.data).ppf(u)
+        return self.ssm.PX(t, xp, self.data[0:t]).ppf(u)
 
     def logpt(self, t, xp, x):
         ''' PDF of X_t|X_{t-1}=xp '''
-        return self.ssm.PX(t, xp, self.data).logpdf(x)
+        return self.ssm.PX(t, xp, self.data[0:t]).logpdf(x)
 
     def upper_bound_trans(self, t):
         return self.ssm.upper_bound_log_pt(t)
@@ -371,31 +373,33 @@ class GuidedPF(Bootstrap):
     Argument ssm must implement methods `proposal0` and `proposal`.
     """
 
+    # (!) arguments modified (!)
+
     def M0(self, N):
-        return self.ssm.proposal0(self.data).rvs(size=N)
+        return self.ssm.proposal0(self.data[0]).rvs(size=N)
 
     def M(self, t, xp):
-        return self.ssm.proposal(t, xp, self.data).rvs(size=xp.shape[0])
+        return self.ssm.proposal(t, xp, self.data[0:t+1]).rvs(size=xp.shape[0])
 
     def logG(self, t, xp, x):
         if t == 0:
             return (
-                self.ssm.PX0().logpdf(x)
+                self.ssm.PX0(self.data[0]).logpdf(x)
                 + self.ssm.PY(0, x).logpdf(self.data[0])
-                - self.ssm.proposal0(self.data).logpdf(x)
+                - self.ssm.proposal0(self.data[0]).logpdf(x)
             )
         else:
             return (
-                self.ssm.PX(t, xp, self.data[t-1]).logpdf(x)
+                self.ssm.PX(t, xp, self.data[0:t]).logpdf(x)
                 + self.ssm.PY(t, x).logpdf(self.data[t])
-                - self.ssm.proposal(t, xp, self.data).logpdf(x)
+                - self.ssm.proposal(t, xp, self.data[0:t+1]).logpdf(x)
             )
 
     def Gamma0(self, u):
-        return self.ssm.proposal0(self.data).ppf(u)
+        return self.ssm.proposal0(self.data[0]).ppf(u)
 
     def Gamma(self, t, xp, u):
-        return self.ssm.proposal(t, xp, self.data).ppf(u)
+        return self.ssm.proposal(t, xp, self.data[0:t+1]).ppf(u)
 
 
 class APFMixin:
@@ -683,7 +687,7 @@ class ThetaLogistic(StateSpaceModel):
         return dists.Normal(loc=x, scale=self.sigmaY)
 
     def proposal0(self, data):
-        return self.PX0().posterior(data[0], sigma=self.sigmaY)
+        return self.PX0(data[0]).posterior(data[0], sigma=self.sigmaY)
 
     def proposal(self, t, xp, data):
-        return self.PX(t, xp).posterior(data[t], sigma=self.sigmaY)
+        return self.PX(t, xp, data).posterior(data[t], sigma=self.sigmaY)

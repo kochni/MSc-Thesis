@@ -51,7 +51,7 @@ distribution that produces output n with probability ``W[n]``.  It does so
 using an algorithm with complexity O(M+N), as explained in Section 9.4 of the
 book. However, this function is not really suited:
 
-    1. if you don't want to get ordered samples, but truly IID ones; 
+    1. if you don't want to get ordered samples, but truly IID ones;
 
     1. if you want to draw only **once** from that distribution;
 
@@ -87,12 +87,12 @@ the normalised weights and their ESS. Here is a quick example::
 
     from numpy import random
 
-    wgts = rs.Weights(lw=random.randn(10))  # we provide log-weights
-    print(wgts.W)  # the normalised weights have been computed automatically
-    print(wgts.ESS)  # and so the ESS
+    wgts = rs.Weights(lw=random.randn(10))  # we provide log-weights
+    print(wgts.W)  # the normalised weights have been computed automatically
+    print(wgts.ESS)  # and so the ESS
     incr_lw = 3. * random.randn(10)  # incremental weights
     new_wgts = wgts.add(incr_lw)
-    print(new_wgts.ESS)  # the ESS of the new weights
+    print(new_wgts.ESS)  # the ESS of the new weights
 
 .. warning::
     `Weights` objects should be considered as immutable: in particular method `add`
@@ -224,6 +224,10 @@ class Weights:
             self.log_mean = m + np.log(s / self.N)
             self.W = w / s
             self.ESS = 1.0 / np.sum(self.W ** 2)
+
+            # (!) modification (!)
+            # Deviance Information Criterion:
+
 
     @property
     def N(self):
@@ -551,9 +555,9 @@ def multinomial(W, M):
     Note
     ----
     As explained in the book, the output of this function is ordered. This is
-    fine in most practical cases, but, in case you need truly IID samples, use 
+    fine in most practical cases, but, in case you need truly IID samples, use
     `multinomial_iid` instead (which calls `multinomial`, and randomly
-    permutate the result). 
+    permutate the result).
     """
     return inverse_cdf(uniform_spacings(M), W)
 
@@ -564,7 +568,7 @@ def multinomial_iid(W, M=None):
     Same as multinomial resampling, except the output is randomly permuted, to
     ensure that the resampled indices are IID (independent and identically
     distributed).
-    
+
     """
     A = multinomial(W, M=M)
     random.shuffle(A)
@@ -715,7 +719,7 @@ class MultinomialQueue:
         g = MulinomialQueue(M,W)
         first_set_of_draws = g.dequeue(k1)
         second_set_of_draws = g.dequeue(k2)
-        # ... and so on
+        # ... and so on
 
     At initialisation, a vector of size M is created, and each time dequeue(k)
     is invoked, the next k draws are produced. When all the draws have been
