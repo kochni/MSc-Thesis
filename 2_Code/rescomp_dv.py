@@ -11,7 +11,7 @@ from esig import stream2sig, stream2logsig, sigdim, logsigdim
 from operator import itemgetter
 
 
-class ResComp:
+class ResCompDV:
     '''
     Reservoir computers for deterministic volatility models
 
@@ -21,7 +21,8 @@ class ResComp:
     variant: string
         type of the RC approach use; one of 'elm' (for Extreme Learning
         Machine), 'esn' (for Echo State Network), 't_sig' (for truncated
-        signature), and 'r_sig' (for randomized signature);
+        signature), 'log_sig' (for log-Signature), and 'r_sig' (for
+        randomized signature);
         ELM is Markovian, while others model path-dependence.
 
     hyper: dict
@@ -41,30 +42,64 @@ class ResComp:
 
         self.variant = variant
         self.K = K
-        self.q = q = hyper['q']
+        self.L = L = hyper.get('L')  # no. of hidden layers
+        self.H = H = hyper.get('H')  # first hidden layer width
+        self.q = q = hyper['q']      # last hidden layer width
         sd = hyper.get('sd')
+        self.activ = hyper.get('activ')
 
         # draw random components
         if variant == 'elm':  # inner parameters of NN
-            # H = 100  # hidden layer width
-            self.A = np.random.normal(scale=sd, size=[q, 3, K])
-            self.b = np.random.normal(scale=sd, size=[q, 1, K])
-            # self.A2 = np.random.normal(scale=sd, size=[q, H, K])
-            # self.b2 = np.random.normal(scale=sd, size=[q, 1, K])
+            H = q if L == 1 else H
+            self.A1 = np.random.normal(scale=sd, size=[H, 2])
+            self.b1 = np.random.normal(scale=sd, size=[H, 1])
+            self.A2 = np.random.normal(scale=sd, size=[q, H])
+            self.b2 = np.random.normal(scale=sd, size=[q, 1])
+
+            # to save random projection:
+            if L == 1:
+                self.A = self.A1
+                self.b = self.b1
+            else:
+                self.A = [self.A1, self.A2]
+                self.b = [self.b1, self.b2]
 
         elif variant == 'esn':
-            self.A = np.random.normal(scale=sd, size=[q, q, K])
-            self.C = np.random.normal(scale=sd, size=[q, 3, K])
-            self.b = np.random.normal(scale=sd, size=[q, 1, K])
+            self.A = np.random.normal(scale=sd, size=[q, q])
+            self.C = np.random.normal(scale=sd, size=[q, 2])
+            self.b = np.random.normal(scale=sd, size=[q, 1])
+            self.res_0 = np.random.normal(scale=sd, size=[q, 1])
 
-        elif variant == 'r-sig':  # random matrices of Controlled ODE
-            self.rsig_0 = np.random.normal(scale=sd, size=[q, 1, K])
-            self.A1 = np.random.normal(scale=sd, size=[q, q, K])
-            self.A2 = np.random.normal(scale=sd, size=[q, q, K])
-            self.A3 = np.random.normal(scale=sd, size=[q, q, K])
-            self.b1 = np.random.normal(scale=sd, size=[q, 1, K])
-            self.b2 = np.random.normal(scale=sd, size=[q, 1, K])
-            self.b3 = np.random.normal(scale=sd, size=[q, 1, K])
+            spec_rad_A = max(abs(np.linalg.eigvals(self.A)))
+            self.A = self.A / (spec_rad_A + 0.1)
+            self.C = self.C / (spec_rad_A + 0.1)
+            self.b = self.b / (spec_rad_A + 0.1)
+
+        elif variant == 'barron':
+            self.C1 = np.random.normal(scale=sd, size=[q, q])
+            self.b1 = np.random.normal(scale=sd, size=[q, 1])
+            self.A2 = np.random.normal(scale=sd, size=[q, q])
+            self.C2 = np.random.normal(scale=sd, size=[q, 2])
+            self.b2 = np.random.normal(scale=sd, size=[q, 1])
+            self.res_0 = np.random.normal(scale=sd, size=[q, 1])
+
+            spec_rad_A2 = max(abs(np.linalg.eigvals(self.A2)))
+            self.A2 = self.A2 / (spec_rad_A2 + 0.1)
+            self.C2 = self.C2 / (spec_rad_A2 + 0.1)
+            self.b2 = self.b2 / (spec_rad_A2 + 0.1)
+
+        elif variant == 'rand-sig':  # random matrices of Controlled ODE
+            self.A1 = np.random.normal(scale=sd, size=[q, q])
+            self.A2 = np.random.normal(scale=sd, size=[q, q])
+            self.A3 = np.random.normal(scale=sd, size=[q, q])
+            self.b1 = np.random.normal(scale=sd, size=[q, 1])
+            self.b2 = np.random.normal(scale=sd, size=[q, 1])
+            self.b3 = np.random.normal(scale=sd, size=[q, 1])
+            self.rsig_0 = np.random.normal(scale=sd, size=[q, 1])
+
+            # self.A1 = self.A1 / max(abs(np.linalg.eigvals(self.A1)))
+            # self.A2 = self.A2 / max(abs(np.linalg.eigvals(self.A2)))
+            # self.A3 = self.A3 / max(abs(np.linalg.eigvals(self.A3)))
 
         else:  # variant == 'sig'
             # compute minimum required truncation level to obtain enough
@@ -74,63 +109,54 @@ class ResComp:
                 sig_length = sigdim
             elif variant == 'logsig':
                 sig_length = logsigdim
-            while sig_length(2, self.sig_len) < self.q + 1:
+            while sig_length(2, self.sig_len) < q:
                 self.sig_len += 1
-
-        # extract repeatedly accessed hyperparameters
-        self.activ = hyper.get('activ')
-        self.s2_0 = np.random.gamma(1., 0.5, size=1)  # initial volatility
-        self.res_0 = np.random.normal(size=[q, 1, 1])
 
     def elm_vol(self, theta, X, t):
         '''
-        compute volatility by passing past volatility & returns through a
-        random 2-layer neural network, a.k.a. "extreme learning machine (ELM)"
+        compute volatility by passing time index, past log-variance, and
+        past log-return through a random neural network, a.k.a. "extreme
+        learning machine (ELM)"
 
         '''
         N = len(theta)
         K = self.K
         q = self.q
 
-        # extract parameters (updated at every t)
-        w0s = np.full([N, K], np.nan)
-        Ws = np.full([q, N, K], np.nan)
-        if K == 1:
-            w0s[:, 0] = theta['w0']
-            for j in range(q):
-                Ws[j, :, 0] = theta['w' + str(j)]
-        else:
-            for k in range(K):
-                w0s[:, k] = theta['w0_' + str(k)]
-                for j in range(q):
-                    Ws[j, :, k] = theta['w' + str(j) + '_' + str(k)]
+        # extract weights
+        w_names = ['w' + str(j) for j in range(q+1)]
+        w = itemgetter(*w_names)(theta)
+        w = np.array(w)  # (q+1,N)
+        w0 = w[-1, :]  # (q,N,)
+        w = w[:-1, :]  # (N,)
 
-        w0s = np.clip(w0s, -1e20, 1e20)
-        Ws = np.clip(Ws, -1e20, 1e20)
+        w0 = np.clip(w0, -1e20, 1e20)
+        w = np.clip(w, -1e20, 1e20)
 
-        # shape initial vol to (N,K) of identical entries
-        log_s2_j = np.full([N, K], np.log(self.s2_0))
+        # shape initial vol to (N,) of identical entries
+        s2_0 = X[0]**2
+        log_s2_j = np.full([N], np.log(s2_0))  # (N,K)
+        # at t=0, loop is not entered
         for j in range(1, t+1):
-            log_s2_prev = log_s2_j
+            # input to reservoir: previous log-var, previous return
+            # time = np.full([N], j)
+            X_prev = np.full([N], X[j-1])
+            Z = np.stack([X_prev, log_s2_j], axis=0)   # (2,N)
+            # Z = np.stack([time, X_prev, log_s2_j], axis=0)  # (3,N)
 
-            # input to reservoir: t, previous log-var, previous return
-            time = np.full([N, K], t)
-            X_prev = np.full([N, K], X[t-1])
-            M = np.stack([time, X_prev, log_s2_prev], axis=0)  # (3,N,K)
-            # M = np.stack([X_prev, log_s2_prev], axis=0)  # (2,N,K)
+            # first hidden layer:
+            h1 = np.matmul(self.A1, Z) + self.b1
+            h1 = self.activ(h1)  # (q,N)
 
-            # hidden nodes 1:
-            h1 = np.einsum('HIK,INK->HNK', self.A, M) + self.b
-            h1 = self.activ(h1)  # (H,N,K)
+            if self.L >= 2:
+                # second hidden layer:
+                h2 = np.matmul(self.A2, h1) + self.b2
+                res = self.activ(h2)
+            else:
+                res = h1
 
-            # hidden nodes 2:
-            # h2 = np.einsum('qHK,HNK->qNK', self.A2, h1)+ self.b2
-            # res = self.activ(h2)
-            res = h1
-
-            # get volatility from reservoir & readout:
-            log_s2_j = np.einsum('qNK,qNK->qNK', Ws, res) + w0s
-            log_s2_j = np.einsum('qNK->NK', log_s2_j)
+            # linear readout
+            log_s2_j = np.sum(w * res, axis=0) + w0
             log_s2_j = np.clip(log_s2_j, -100., 100.)
 
         s_t = np.exp(0.5*log_s2_j)
@@ -142,48 +168,93 @@ class ResComp:
         Echo State Network
 
         log(σ_t^2) = w·r_t
-        r_t = ϕ(C·r_{t-1} + A·z_{t-1} + b)
+        r_t = ϕ(A·r_{t-1} + C·z_{t-1} + b)
 
         '''
         N = len(theta)
         K = self.K
         q = self.q
 
-        # extract parameters (updated at every t)
-        w0s = np.full([N, K], np.nan)
-        Ws = np.full([q, N, K], np.nan)
-        if K == 1:
-            w0s[:, 0] = theta['w0']
-            for j in range(q):
-                Ws[j, :, 0] = theta['w' + str(j)]
-        else:
-            for k in range(K):
-                w0s[:, k] = theta['w0_' + str(k)]
-                for j in range(q):
-                    Ws[j, :, k] = theta['w' + str(j) + '_' + str(k)]
+        # extract weights
+        w_names = ['w' + str(j) for j in range(q+1)]
+        w = itemgetter(*w_names)(theta)
+        w = np.array(w)  # (q+1,N)
+        w0 = w[-1, :]  # (q,N,)
+        w = w[:-1, :]  # (N,)
 
-        w0s = np.clip(w0s, -1e20, 1e20)
-        Ws = np.clip(Ws, -1e20, 1e20)
+        w0 = np.clip(w0, -1e20, 1e20)
+        w = np.clip(w, -1e20, 1e20)
 
         # shape initial vol to (N,K) of identical entries
-        log_s2_j = np.full([N, K], np.log(self.s2_0))  # (N,K)
-        res_j  = np.tile(self.res_0, [1, N, K])  # (1,N,K)
+        s2_0 = X[0]**2
+        log_s2_j = np.full([N], np.log(s2_0))  # (N,)
+        res_j  = np.tile(self.res_0, [1, N])  # (q,N)
+        # at t=0, loop is not entered
         for j in range(1, t+1):
             # recurrent reservoir step:
-            h1 = np.einsum('qpK,qNK->qNK', self.A, res_j)  # (q,N,K)
+            h1 = np.matmul(self.A, res_j)  # (q,N)
 
             # input variable: t, previous log-var, previous return
-            time = np.full([N, K], t)
-            X_prev = np.full([N, K], X[t-1])
-            M = np.stack([time, X_prev, log_s2_j], axis=0)  # (3,N,K)
-            h2 = np.einsum('qIK,INK->qNK', self.C, M)
+            time = np.full([N], j)
+            X_prev = np.full([N], X[j-1])
+            M = np.stack([X_prev, log_s2_j], axis=0)  # (2,N)
+            # M = np.stack([time, X_prev, log_s2_j], axis=0)  # (3,N)
+            h2 = np.matmul(self.C, M)
 
             # new reservoir
-            res_j = self.activ(h1 + h2 + self.b)  # (q,N,K)
+            res_j = self.activ(h1 + h2 + self.b)  # (q,N)
 
             # get volatility from reservoir & readout:
-            log_s2_j = np.einsum('qNK,qNK->qNK', Ws, res_j) + w0s
-            log_s2_j = np.einsum('qNK->NK', log_s2_j)
+            log_s2_j = np.sum(w * res_j, axis=0) + w0
+            log_s2_j = np.clip(log_s2_j, -100., 100.)
+
+        s_t = np.exp(0.5*log_s2_j)
+
+        return s_t
+
+
+    def barron_vol(self, theta, X, t):
+        '''
+        Echo State Network with ELM readout
+
+        log(σ_t^2) = w·u_t
+        u_t = ϕ(C2·r_t + b2)
+        r_t = ϕ(A1·r_{t-1} + C1·z_{t-1} + b1)
+
+        '''
+        N = len(theta)
+        K = self.K
+        q = self.q
+
+        # extract weights
+        w_names = ['w' + str(j) for j in range(q+1)]
+        w = itemgetter(*w_names)(theta)
+        w = np.array(w)  # (q+1,N)
+        w0 = w[-1, :]  # (q,N,)
+        w = w[:-1, :]  # (N,)
+
+        w0 = np.clip(w0, -1e20, 1e20)
+        w = np.clip(w, -1e20, 1e20)
+
+        # shape initial vol to (N,K) of identical entries
+        s2_0 = X[0]**2
+        log_s2_j = np.full([N], np.log(s2_0))  # (N)
+        res_j  = np.tile(self.res_0, [1, N])  # (q,N)
+        # at t=0, loop is not entered
+        for j in range(1, t+1):
+            # ESN reservoir:
+            h1 = np.matmul(self.A2, res_j)  # (q,N)
+            # time = np.full([N], j)
+            X_prev = np.full([N], X[j-1])
+            Z = np.stack([X_prev, log_s2_j], axis=0)  # (2,N)
+            # Z = np.stack([time, X_prev, log_s2_j], axis=0)  # (3,N)
+            h2 = np.matmul(self.C2, Z)
+            res_j = self.activ(h1 + h2 + self.b1)  # (q,N)
+
+            # ELM readout on ESN reservoir:
+            u = np.matmul(self.C1, res_j) + self.b2
+            u = self.activ(u)
+            log_s2_j = np.sum(w * u, axis=0) + w0
             log_s2_j = np.clip(log_s2_j, -100., 100.)
 
         s_t = np.exp(0.5*log_s2_j)
@@ -193,34 +264,36 @@ class ResComp:
 
     def sig_vol(self, theta, X, t):
         '''
-        compute volatility from the truncated signature of the time-extended
-        path of the log-returns, (t, X_t)
+        compute volatility from the truncated (log-)signature of the
+        time-extended path of the log-returns, (t, X_t)
 
         '''
         N = len(theta)
-        K = self.K
         q = self.q
         sig_len = self.sig_len
 
-        if t > 0:
+        if t > 2:
             # extract Sig version
-            if self.variant == 'standard': # standard Signature
+            if self.variant == 'sig':  # standard Signature
                 Sig = stream2sig
-            elif self.variant == 'logsig':   # log-Signature
+            elif self.variant == 'logsig':  # log-Signature
                 Sig = stream2logsig
 
             # extract weights
             w_names = ['w' + str(j) for j in range(q+1)]
             w = itemgetter(*w_names)(theta)
             w = np.array(w)  # (q+1,N)
+            w0 = w[-1, :]  # (q,N,)
+            w = w[:-1, :]  # (N,)
 
             # input path: time and returns until time t-1
             time = np.arange(0, t, 1)
             X_past = X[:t]
-            u = np.stack([time, X_past]).T # (t,2)
-            S = Sig(u, sig_len)[:q+1]  # (q+1,)
-            S = S.reshape(-1, 1)  # (q+1,1)
-            log_s2_t = np.sum(w * S, axis=0) + w[0, :]  # (N,)
+            u = np.vstack([time, X_past]).T # (t,2)
+            S = Sig(u, sig_len)[:q]  # (q,)
+            S = S.reshape(-1, 1)  # (1,q)
+
+            log_s2_t = np.sum(w * S, axis=0) + w0  # (N,)
 
             # extract weights:
             # if K == 1:
@@ -238,7 +311,8 @@ class ResComp:
             s_t = np.exp(0.5*log_s2_t)
 
         else:  # t == 0
-            s_t = np.full([N], np.sqrt(self.s2_0))
+            s2_0 = X[0]**2
+            s_t = np.full([N], np.sqrt(s2_0))
 
         return s_t
 
@@ -253,62 +327,48 @@ class ResComp:
         K = self.K
         q = self.q
 
-        w = np.full([q, N, K], np.nan)
-        w0 = np.full([N, K], np.nan)
-
-        if K == 1:
-            w_names = ['w' + str(j) for j in range(q+1)]
-            w0_w = itemgetter(*w_names)(theta)  # (q+1,N)
-            w0_w = np.array(w0_w)
-            w0[:, 0] = w0_w[0, :]  # (N,)
-            w[:, :, 0] = w0_w[1:, :]  # (q,N)
-        else:  # multi-regime
-            for k in range(K):
-                w_names = ['w' + str(j) + '_' + str(k) for j in range(q+1)]
-                w = itemgetter(*w_names)(theta)  # (q,N)
-                w = np.array(w)
-                w0[:, k] = w[0, :]
-                w[:, :, k] = w[1:, :]  # (q,N)
+        # extract weights
+        w_names = ['w' + str(j) for j in range(q+1)]
+        w = itemgetter(*w_names)(theta)
+        w = np.array(w)  # (q+1,N)
+        w0 = w[-1, :]  # (q,N,)
+        w = w[:-1, :]  # (N,)
 
         # cap parameters
         w0 = np.clip(w0, -1e20, 1e20)
         w = np.clip(w, -1e20, 1e20)
 
-        if t > 0:
-            log_s2_j = np.full([N, K], np.log(self.s2_0))
-            rsig = np.tile(self.rsig_0, [1, N, 1])  # (q,N,K)
-            for j in range(1, t):
-                # increment from time:
-                incr_1 = np.einsum('qpK,pNK->qNK', self.A1, rsig) + self.b1
-                incr_1 = self.activ(incr_1)  # (q,N,K)
-                # (note: p = q)
+        s2_0 = X[0]**2
+        log_s2_j = np.full([N], np.log(s2_0))  # (N)
+        rsig = np.tile(self.rsig_0, [1, N])  # (q,N)
+        # at t=0, loop is not entered
+        for j in range(1, t):
+            # increment from time:
+            incr_1 = np.matmul(self.A1, rsig) + self.b1
+            incr_1 = self.activ(incr_1)  # (q,N)
+            # (note: p = q)
 
-                # increment from log-returns:
-                incr_2 = np.einsum('qpK,pNK->qNK', self.A2, rsig) + self.b2
-                incr_2 = self.activ(incr_2)  # (q,N,K)
-                delta_X = X[j] - X[j-1]
-                incr_2 = incr_2 * delta_X  # (q,N,K)
+            # increment from log-returns:
+            incr_2 = np.matmul(self.A2, rsig) + self.b2
+            incr_2 = self.activ(incr_2)  # (q,N)
+            delta_X = X[j] - X[j-1]
+            incr_2 = incr_2 * delta_X  # (q,N)
 
-                # increment from log-variance:
-                incr_3 = np.einsum('qpK,pNK->qNK', self.A3, rsig) + self.b3
-                incr_3 = self.activ(incr_2)  # (q,N,K)
-                if j == 1:
-                    delta_logvar = log_s2_j
-                else:
-                    delta_logvar = log_s2_j - log_s2_prev
-                log_s2_prev = log_s2_j
-                incr_3 = incr_3 * delta_logvar  # (q,N,K)
+            # increment from log-variance:
+            incr_3 = np.matmul(self.A3, rsig) + self.b3
+            incr_3 = self.activ(incr_3)  # (q,N)
+            if j == 1:
+                delta_logvar = log_s2_j
+            else:
+                delta_logvar = log_s2_j - log_s2_prev
+            log_s2_prev = log_s2_j
+            incr_3 = incr_3 * delta_logvar  # (q,N)
 
-                rsig = rsig + incr_1 + incr_2 + incr_3  # (q,N,K)
+            rsig = rsig + incr_1 + incr_2 + incr_3  # (q,N)
 
-                # get volatility from reservoir & rSig
-                log_s2_j = np.einsum('qNK,qNK->qNK', w, rsig)
-                log_s2_j = np.einsum('qNK->NK', log_s2_j) + w0  # sum over axis 0
-                log_s2_j = np.clip(log_s2_j, -50., 50.)
-
-        else:  # t = 0:
-            s_t = np.full([N, K], np.sqrt(self.s2_0))
-            return s_t
+            # get volatility from reservoir & rSig
+            log_s2_j = np.sum(w * rsig, axis=0) + w0
+            log_s2_j = np.clip(log_s2_j, -100., 100.)
 
         s_t = np.exp(0.5*log_s2_j)
 
@@ -320,7 +380,9 @@ class ResComp:
             s_t = self.elm_vol(theta, X, t)
         elif self.variant == 'esn':
             s_t = self.esn_vol(theta, X, t)
-        elif self.variant == 'r-sig':
+        elif self.variant == 'barron':
+            s_t = self.barron_vol(theta, X, t)
+        elif self.variant == 'rand-sig':
             s_t = self.rsig_vol(theta, X, t)
         else:  # variant = t_sig or log_sig
             s_t = self.sig_vol(theta, X, t)

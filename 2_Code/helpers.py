@@ -187,7 +187,7 @@ def set_prior(model):
 
 def out_fct(smc):  # to collect only relevant things to save memory
     '''
-    function defining which quantities/variables to collect while running SMC.
+    function defining which quantities/variables to collect after running SMC.
 
     Parameters:
     -----------
@@ -196,7 +196,8 @@ def out_fct(smc):  # to collect only relevant things to save memory
         model; object which contains variables to be collected as attributes
 
     '''
-    Z = np.array(smc.summaries.logLts)
+    Z = np.array(smc.summaries.logLts)  # log of mean likelihoods
+    DIC = None
     theta = smc.X.theta
     prior = smc.fk.model.prior.laws
     W = smc.W
@@ -205,17 +206,22 @@ def out_fct(smc):  # to collect only relevant things to save memory
     MH_acc = np.array(smc.X.shared['acc_rates']).flatten()
     preds = smc.preds
     predsets = smc.predsets
+    rand_proj = smc.rand_proj
+    cpu_time = smc.cpu_time
 
     dic = {
         'Z': Z,
-        'theta_T': theta,
-        'W_T': W,
+        'DIC': DIC,
+        'theta': theta,
+        'W': W,
         'prior': prior,
         'ESS': ESS,
         'rs_flags': rs_flags,
         'MH_Acc': MH_acc,
         'Preds': preds,
-        'PredSets': predsets
+        'PredSets': predsets,
+        'RandProj': rand_proj,
+        'cpu_time': cpu_time
         }
 
     return dic

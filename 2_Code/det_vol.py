@@ -33,9 +33,9 @@ class DetVol(StaticModel):
         super().__init__(data=X, prior=prior)
 
         # define model
-        dynamics = spec['dynamics']
-        variant = spec.get('variant')
-        hyper = spec.get('hyper')
+        self.dynamics = spec['dynamics']
+        self.variant = spec.get('variant')
+        self.hyper = spec.get('hyper')
         self.innov_X = spec['innov_X']
         self.theta_FX = {  # parameters of innovation distribution
             'tail': None,
@@ -43,27 +43,34 @@ class DetVol(StaticModel):
             'skew': None
             }
         self.switching = spec.get('switching')
-        self.K = K = spec.get('regimes') if self.switching is not None else 1
+        self.K = spec.get('regimes') if self.switching is not None else 1
 
         err_msg = "Specified multi-regime model but not switching type"
         if self.K > 1: assert self.switching is not None, err_msg
 
         err_msg = "Can't have jumps in volatility in DetVol, use StochVol"
         assert spec.get('jumps') not in ['V', 'vol', 'volatility'], err_msg
-        self.jumps = spec.get('jumps')
+        self.jumps_X = spec.get('jumps_X')
 
-        if dynamics == 'constant':
-            self.model = WhiteNoise(K)
-        elif dynamics == 'garch':
-            self.model = GARCH(variant, K)
-        elif dynamics == 'elm':
-            self.model = ResComp('elm', hyper, K)
-        elif dynamics == 'esn':
-            self.model = ResComp('esn', hyper, K)
-        elif dynamics == 'sig':
-            self.model = ResComp(variant, hyper, K)
-        elif dynamics == 'guyon':
-            self.model = Guyon(K)
+        err_msg = "Can only have jumps with Gaussian or GenHyp innovations"
+        if self.jumps_X is True: assert self.innov_X in ['N', 'GH'], err_msg
+
+    def generate_matrices(self):
+        '''
+        (re-)instatiates model classes, thereby drawing new random matrices
+        in the case of reservoir computers;
+        called at beginning of each run
+
+        '''
+
+        if self.dynamics == 'constant':
+            self.model = WhiteNoise(self.K)
+        elif self.dynamics == 'garch':
+            self.model = GARCH(self.variant, self.K)
+        elif self.dynamics == 'guyon':
+            self.model = Guyon(self.K)
+        elif self.dynamics == 'rescomp':
+            self.model = ResCompDV(self.variant, self.hyper, self.K)
 
     def vols(self, theta, X, t):
         N = len(theta)
@@ -73,7 +80,7 @@ class DetVol(StaticModel):
         s_t = self.model.vol(theta, X, t)  # (N,K)
 
         # add volatilities w/ jump:
-        if self.jumps is not None:
+        if self.jumps_X is True:
             lambda_X = np.clip(theta['lambda_X'], 0., 1.)
             phi_X = np.clip(theta['phi_X'], 0., None)
             phi_X = phi_X.reshape(N, 1)  # (N,K=1)
@@ -102,7 +109,7 @@ class DetVol(StaticModel):
         X = self.data[0:t]  # filtration X_0, ..., X_{t-1}
 
         # single-regime models
-        if K == 1:
+        if self.switching is None or K == 1:
             p_t = np.full([N, K], 1.)
 
         # Mixture Models:
@@ -117,7 +124,7 @@ class DetVol(StaticModel):
         else:
             p_t = np.full([N, K], 0.)
             for i in range(N):  # (!) parallelizable ??
-                df = theta['df'][i] if 'df' in theta.dtype.names else None
+                df_X = theta['df_X'][i] if 'df_X' in theta.dtype.names else None
                 P = np.full([K, K], 0.)  # transition matrix
                 for k in range(K):
                     P[k, 0:-1] = np.clip(theta['P_' + str(k)][i], 0., 1.)
@@ -137,7 +144,7 @@ class DetVol(StaticModel):
                     p_t[i, :] = 1./K
 
         # add jumps
-        if self.jumps is not None:
+        if self.jumps_X is True:
             lambda_X = np.clip(theta['lambda_X'], 0., 1.)
             probs_nj = np.einsum('N,NK->NK', 1.0-lambda_X, p_t)
             probs_j = np.einsum('N,NK->NK', lambda_X, p_t)
@@ -150,14 +157,14 @@ class DetVol(StaticModel):
 
     def logpyt(self, theta, t):
         '''
-        (expected) likelihood of parameters
+        (expected) likelihood of current observation given parameters
 
         '''
         N = len(theta)
         K = self.K
         innov_X = self.innov_X
         theta_FX = self.theta_FX
-        X = self.data[0:t]  # filtration at time t, X_0, ..., X_{t-1}
+        X = self.data[:max(1, t)]  # filtration
 
         # Volatilities w/o jump:
         self.s_t = s_t = self.vols(theta, X, t)  # (N,K,J)
@@ -169,7 +176,7 @@ class DetVol(StaticModel):
         theta_FX = self.theta_FX
         if self.innov_X == 't':
             df_X = theta['df_X']
-            df_X = np.clip(df_X, 2.+1e-10, None)
+            df_X = np.clip(df_X, 3., 500.)
             theta_FX['df'] = df_X.reshape(N, 1, 1)  # (N,1,1)
         elif self.innov_X == 'GH':
             tail_X = theta['tail_X']
@@ -179,13 +186,13 @@ class DetVol(StaticModel):
             skew_X = np.clip(skew_X, -50., 50.)
             theta_FX['skew'] = skew_X.reshape(N, 1, 1)  # (N,1,1)
             shape_X = theta['shape_X']
-            shape_X = np.clip(shape_X, abs(skew_X)+1e-3, 50.+1e-3)
+            shape_X = np.clip(shape_X, abs(skew_X)+0.01, 50.01)
             theta_FX['shape'] = shape_X.reshape(N, 1, 1)  # (N,1,1)
 
         # Expected likelihood over regimes & jumps:
         liks = F_innov(0., s_t, **theta_FX).pdf(self.data[t])
         E_lik = np.einsum('NKJ,NKJ->N', p_t, liks)
-        E_lik = np.clip(E_lik, 1e-100, None)  # avoids error when taking log
+        E_lik = np.clip(E_lik, 1e-20, None)  # avoids error when taking log
         log_E_lik = np.log(E_lik)
         assert not np.isnan(log_E_lik).any(), "NaNs in log-likelihoods"
 

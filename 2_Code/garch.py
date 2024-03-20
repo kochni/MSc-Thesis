@@ -17,19 +17,18 @@ class GARCH:
 
     def __init__(self, variant, K, hyper=None):
 
-        msg = "Specified GARCH-variant not implemented"
-        assert variant in ['basic', 'gjr', 'thr', 'exp', 'elm'], msg
+        err_msg = "Specified GARCH-variant not implemented"
+        assert variant in ['basic', 'gjr', 'thr', 'exp', 'elm'], err_msg
         self.variant = variant
         self.hyper = hyper
         self.K = K
 
-        # random initial volatility
-        self.s2_0 = np.random.gamma(1., 0.5, size=1)
-
     def vol_std(self, theta, X, t=None):
         '''
-        compute the standard GARCH volatility for 1 or more regimes at time t
-        given the parameters
+        GARCH:
+
+            σ_t^2 = ω + α·X_{t-1}^2 + β·σ_{t-1}^2
+
         '''
         # by default compute volatility for first period outside dataset
         t = len(X) if t is None else t
@@ -72,7 +71,8 @@ class GARCH:
         b = np.einsum('NK,NKt,t->NK', alphas, beta_pow, X_rev**2)
 
         #  β^t·σ_0^2
-        c = betas**t * self.s2_0
+        s2_0 = X[0]**2
+        c = betas**t * s2_0
 
         s2_t = a + b + c
         # --> s2_t[i, j] is squared volatility of i-th particle in j-th regime
@@ -84,9 +84,9 @@ class GARCH:
 
     def vol_gjr(self, theta, X, t):
         '''
-        compute the GJR-GARCH volatility for K regimes at time t:
+        GJR-GARCH:
 
-            σ_t^2 = ω + (α + γ·1(X_{t-1}>0))·X_{t-1}^2 + β·σ_{t-1}^2
+            σ_t^2 = ω + (α + γ·1(X_{t-1}<0))·X_{t-1}^2 + β·σ_{t-1}^2
 
         '''
         N = len(theta)
@@ -120,7 +120,7 @@ class GARCH:
 
         # compute GJR-GARCH volatilities:
         # s2_t = ω·Σ_{j=1}^t β^j + α·Σ_{j=1}^t β^j X_{t-j}^2 + β^t·σ_0^2
-        #        + Σ_{j=1}^t β^j 1(X_{t-j}<0) X_{t-j}^2
+        #        + γ·Σ_{j=1}^t β^j 1(X_{t-j}<0) X_{t-j}^2
 
         # β_{ik}^j, i=1,...,N, k=0,...,K-1, j=0,...,t
         beta_pow = betas.reshape(N, K, 1) ** t_grid  # (N,K,t)
@@ -129,13 +129,16 @@ class GARCH:
         a = np.einsum('NK,NKt->NK', omegas, beta_pow)
 
         # α·Σ_{j=1}^t β^j X_{t-j}^2
-        b = np.einsum('NK,NKt,t->NK', alphas, beta_pow, X_rev**2)
+        b = np.einsum('NK,NKt,t->NK', alphas, beta_pow, X_rev**2,
+                      optimize='greedy')
 
         #  β^t·σ_0^2
-        c = betas**t * self.s2_0
+        s2_0 = X[0]**2
+        c = betas**t * s2_0
 
         # γ·Σ_{j=1}^t β^j 1(X_{t-j}<0) X_{t-j}^2
-        d = np.einsum('NK,NKt,t,t->NK', gammas, beta_pow, 1*(X_rev<0), X_rev**2)
+        d = np.einsum('NK,NKt,t,t->NK', gammas, beta_pow, 1*(X_rev<0), X_rev**2,
+                      optimize='greedy')
 
         s2_t = a + b + c + d
 
@@ -146,9 +149,9 @@ class GARCH:
 
     def vol_thr(self, theta, X, t):
         '''
-        compute the Threshold-GARCH volatility for K regimes at time t:
+        T-GARCH:
 
-            σ^2_t = ω + (α + γ·1(X_{t-1}>0))·X_{t-1}^2 + β·σ_{t-1}^2
+            σ_t = ω + α·|X_{t-1}| + γ·X_{t-1} + β·σ_{t-1}
 
         '''
         N = len(theta)
@@ -176,8 +179,8 @@ class GARCH:
         t_grid = np.arange(0, t, 1)  # all time lags
 
         # compute GJR-GARCH volatilities:
-        # s_t = ω·Σ_{j=1}^t β^j + α·Σ_{j=1}^t β^j X_{t-j}^2 + β^t·σ_0^2
-        #        + Σ_{j=1}^t β^j 1(X_{t-j}<0) X_{t-j}^2
+        # s_t = ω·Σ_{j=1}^t β^j + α·Σ_{j=1}^t β^j |X_{t-j}| + β^t·σ_0^2
+        #       + γ·Σ_{j=1}^t β^j X_{t-j}
 
         # β_{ik}^j, i=1,...,N, k=0,...,K-1, j=0,...,t
         beta_pow = betas.reshape(N, K, 1) ** t_grid  # (N,K,t)
@@ -186,13 +189,15 @@ class GARCH:
         a = np.einsum('NK,NKt->NK', omegas, beta_pow)
 
         # α·Σ_{j=1}^t β^j |X_{t-j}|
-        b = np.einsum('NK,NKt,t->NK', alphas, beta_pow, abs(X_rev))
+        b = np.einsum('NK,NKt,t->NK', alphas, beta_pow, abs(X_rev),
+                      optimize='greedy')
 
         # β^t·σ_0
-        c = betas**t * self.s2_0
+        s2_0 = X[0]**2
+        c = betas**t * np.sqrt(s2_0)
 
-        # γ·Σ_{j=1}^t β^j 1(X_{t-j}<0) X_{t-j}
-        d = np.einsum('NK,NKt,t,t->NK', gammas, beta_pow, 1*(X_rev<0), X_rev)
+        # γ·Σ_{j=1}^t β^j X_{t-j}
+        d = np.einsum('NK,NKt,t->NK', gammas, beta_pow, X_rev)
 
         s_t = a + b + c + d
 
@@ -200,9 +205,9 @@ class GARCH:
 
     def vol_exp(self, theta, X, t):
         '''
-        compute the Exponential-GARCH volatility for K regimes at time t:
+        E-GARCH:
 
-            log(σ^2_t) = ω + α·(|Z_{t-1}| + γ·Z_{t-1}) + β·log(σ^2_{t-1})
+            log(σ^2_t) = ω + α·|X_{t-1}| + γ·X_{t-1}) + β·log(σ^2_{t-1})
 
         '''
         N = len(theta)
@@ -230,9 +235,9 @@ class GARCH:
         # all time lags
         t_grid = np.arange(0, t, 1)
 
-        # compute GJR-GARCH volatilities:
-        # log(s2_t) = ω·Σ_{j=1}^t β^j + α·Σ_{j=1}^t β^j X_{t-j}^2 + β^t·σ_0^2
-        #             + γ·Σ_{j=1}^t β^j 1(X_{t-j}<0) X_{t-j}^2
+        # compute E-GARCH volatilities:
+        # log(s2_t) = ω·Σ_{j=1}^t β^j + α·Σ_{j=1}^t β^j |X_{t-j}| + β^t·σ_0^2
+        #             + γ·Σ_{j=1}^t β^j X_{t-j}
 
         # β_{ik}^j, i=1,...,N, k=0,...,K-1, j=0,...,t
         beta_pow = betas.reshape(N, K, 1) ** t_grid  # (N,K,t)
@@ -245,10 +250,12 @@ class GARCH:
                       optimize='greedy')
 
         # β^t·σ_0^2
-        c = betas**t * self.s2_0
+        s2_0 = X[0]**2
+        c = betas**t * np.log(s2_0)
 
-        # γ·Σ_{j=1}^t β^j 1(X_{t-j}<0) |X_{t-j}|
-        d = np.einsum('NK,NKt,t,t->NK', gammas, beta_pow, 1*(X_rev<0), X_rev)
+        # γ·Σ_{j=1}^t β^j X_{t-j}
+        d = np.einsum('NK,NKt,t->NK', gammas, beta_pow, X_rev,
+                      optimize='greedy')
 
         log_s2_t = a + b + c + d
         log_s2_t = np.clip(log_s2_t, -50., 50.)
@@ -270,9 +277,5 @@ class GARCH:
 
         elif self.variant == 'exp':
             s_t = self.vol_exp(theta, X, t)
-
-        elif self.variant == 'elm':
-            model = ResComp(variant='elm', hyper=self.hyper, K=self.K)
-            s_t = model.vol(theta, X, t)
 
         return s_t

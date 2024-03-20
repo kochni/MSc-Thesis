@@ -21,16 +21,16 @@ def tspl(t, tp, alpha, delta):
 
     return weights
 
+
 class Guyon:
     '''
-    Guyon and Lekeufack's (2023) path-dependent volatility model
+    Guyon and Lekeufack's (2023) handcrafted path-dependent volatility model
 
     '''
 
     def __init__(self, K):
 
         self.K = K
-        self.s2_0 = np.random.gamma(1., 0.5, size=1)  # initial volatility
 
     def vol(self, theta, X, t):
 
@@ -66,7 +66,7 @@ class Guyon:
         d1s = np.clip(d1s, 0., None)
         d2s = np.clip(d2s, 0., None)
 
-        if t > 1:
+        if t > 0:
             # grid of all previous time stamps
             tp_grid = np.arange(0, t, 1)
 
@@ -77,22 +77,18 @@ class Guyon:
             # volatility kernel weights:
             k2 = tspl(t, tp_grid, a2s, d2s)  # (N,K,t)
 
-            trend = np.einsum('NKt,t->NK', k1, X)
-            volat = np.einsum('NKt,t->NK', k2, X**2)
+            trend = np.einsum('NKt,t->NK', k1, X[0:t])
+            volat = np.einsum('NKt,t->NK', k2, X[0:t]**2)
 
             s_t = (omegas +
                    np.einsum('NK,NK->NK', alphas, trend) +
                    np.einsum('NK,NK->NK', betas, volat))
 
-        elif t == 1:
-            trend = X[0]
-            volat = X[0]**2
-            s_t = omegas + alphas * trend + betas * volat
-
         else:  # t == 0:
-            s_t = np.sqrt(self.s2_0)
+            s2_0 = X[0]**2
+            s_t = np.sqrt(s2_0)
             s_t = np.full([N, K], s_t)
 
-        s_t = np.clip(s_t, 1e-50, 1e50)
+        s_t = np.clip(s_t, 1e-50, 1e50)  # (N,K)
 
         return s_t
