@@ -42,19 +42,6 @@ from helpers import *
 from plots import *
 
 
-X_N = np.random.normal(size=100000)
-X_t = stats.t.rvs(df=5, size=100000)
-S_N = 100. * np.exp(0.01*X_N)
-S_t = 100. * np.exp(0.01*X_t)
-C_N = np.clip(S_N-100., 0., None)
-C_t = np.clip(S_t-100., 0., None)
-C_N = C_N[(C_N>0.) * (C_N<6.)]
-C_t = C_t[(C_t>0.) * (C_t<6.)]
-
-plt.hist(C_N, alpha=0.5, bins=100, label="Gaussian", density=True)
-plt.hist(C_t, alpha=0.5, bins=100, label="Student t", density=True)
-plt.legend()
-
 # determine data
 series = 'BTC-USD'
 
