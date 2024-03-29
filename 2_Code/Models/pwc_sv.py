@@ -13,7 +13,7 @@ class PWConstSV(StateSpaceModel):
     '''
     Stochastic volatility model with (piecewise) constant volatility:
 
-        V_t = V_{t-1} + J_t
+        log(V_t^2) = log(V_{t-1}^2) + J_t
 
     '''
     K = 1
