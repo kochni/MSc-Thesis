@@ -1,6 +1,24 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+
+"""
+Reservoir computers for stochastic volatility.
+
+All models are of the form
+
+    X_t = V_t·Z_t
+    log(V_t^2) = ν_t + ξ_t·U_t
+    (ν_t, ξ_t)^T = W·r_t
+    
+where r_t is the reservoir constructed as determined by the reservoir computer
+Implemented reservoir computers:
+    - Extreme Learning Machine
+    - Echo State Network
+    - (Log-)Signature
+    - Randomized Signature
+"""
+
 # basic
 import numpy as np
 
