@@ -1,0 +1,12 @@
+
+% start up
+ssh nikoch@euler.ethz.ch
+**password**
+
+% set up environment
+env2lmod
+module load boost gcc/8.2.0 python/3.11.2
+sbatch -A public bash.sh
+
+% display terminal output
+cat slurm-jobid.out
