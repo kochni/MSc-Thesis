@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+"""
+Approximation of an Ornsteil-Uhlenbeck process via linear maps on
+different versions of path Signatures
+(code for reproducing Figure 3.2 in the text)
+"""
+
 import numpy as np
 
 from esig import stream2sig, stream2logsig, sigdim, logsigdim
