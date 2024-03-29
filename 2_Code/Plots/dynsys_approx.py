@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+"""
+Approximation of a linear state-space system via an ESN and a recurrent Barron functional
+(code for reproducing Figure 3.1 in the text)
+"""
+
 import numpy as np
 
 from sklearn.linear_model import LinearRegression, RidgeCV, LassoCV
