@@ -37,9 +37,9 @@ class ResCompDV:
 
     variant: string
         type of the RC approach use; one of 'elm' (for Extreme Learning
-        Machine), 'esn' (for Echo State Network), 't_sig' (for truncated
-        signature), 'log_sig' (for log-Signature), and 'r_sig' (for
-        randomized signature);
+        Machine), 'esn' (for Echo State Network), 'barron' (for recurrent
+        Barron functional), 't_sig' (for truncated signature), 'log_sig'
+        (for log-Signature), and 'rand_sig' (for randomized signature);
         ELM is Markovian, while others model path-dependence.
 
     hyper: dict
