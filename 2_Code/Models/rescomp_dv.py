@@ -1,6 +1,23 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+"""
+Reservoir computers for deterministic volatility.
+
+All models are of the form
+
+    X_t = σ_t·Z_t
+    log(σ_t^2) = w·r_t
+    
+where r_t is the reservoir constructed as determined by the reservoir computer
+Implemented reservoir computers:
+    - Extreme Learning Machine
+    - Echo State Network
+    - Recurrent Barron Functional
+    - (Log-)Signature
+    - Randomized Signature
+"""
+
 # basic
 import numpy as np
 
