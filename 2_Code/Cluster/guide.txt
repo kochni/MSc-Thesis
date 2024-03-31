@@ -1,6 +1,6 @@
 
 % start up
-ssh nikoch@euler.ethz.ch
+ssh user@euler.ethz.ch
 **password**
 
 % set up environment
