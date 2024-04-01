@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+""" 
+Code for producing plots
+
+"""
+
 import numpy as np
 from scipy import stats
 
