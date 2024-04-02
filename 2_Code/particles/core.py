@@ -458,6 +458,7 @@ class SMC:
 
         return theta
 
+    # (!) modification (!)
     def probs(self, theta, K):
         ''' probabilities of regimes and jumps for SMC^2 models '''
 
@@ -489,6 +490,7 @@ class SMC:
 
         return p_regimes, p_jumps_X, p_jumps_V
 
+    # (!) modification (!)
     def predict_IBIS(self):
         '''
         produce point predictions and prediction sets for IBIS models
@@ -666,6 +668,7 @@ class SMC:
         self.alpha_star_S = np.clip(self.alpha_star_S, 0.001, 0.999)
         self.alpha_star_C = np.clip(self.alpha_star_C, 0.001, 0.999)
 
+    # (!) modification (!)
     def predict_SMC2(self):
         '''
         produce point predictions and prediction sets for SMC^2 models
@@ -874,7 +877,6 @@ class SMC:
         self.alpha_star_RV = np.clip(self.alpha_star_RV, 0.001, 0.999)
         self.alpha_star_S = np.clip(self.alpha_star_S, 0.001, 0.999)
         self.alpha_star_C = np.clip(self.alpha_star_C, 0.001, 0.999)
-
 
     def compute_summaries(self):
         if self.t > 0:
